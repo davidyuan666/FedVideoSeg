@@ -1,0 +1,54 @@
+# Simplified FedVideoQA Configuration
+project:
+  name: "SimpleFedVideoQA"
+  version: "1.0.0"
+  description: "Simplified Federated Learning Framework for Video Question Answering"
+
+# API Configuration
+deepseek:
+  api_url: "https://api.deepseek.com/v1"
+  model: "deepseek-chat"
+  max_tokens: 2048
+  temperature: 0.7
+
+# Video Processing
+video:
+  supported_formats: [".mp4", ".avi", ".mov", ".mkv"]
+  max_duration: 1800  # 30 minutes
+  segment_length: 15  # seconds
+  frame_rate: 1
+
+# Models
+models:
+  clip:
+    model_name: "ViT-B/32"
+  whisper:
+    model_name: "base"
+  bert:
+    model_name: "bert-base-uncased"
+
+# Federated Learning (Simplified)
+federated:
+  num_rounds: 50
+  num_clients: 4
+  fraction_fit: 1.0  # Use all available clients
+  local_epochs: 3
+
+# Privacy (Simple approach)
+privacy:
+  enable_encryption: false  # Disable complex encryption
+  data_anonymization: true  # Simple data anonymization
+  local_only_processing: true  # Keep data local
+
+# Training
+training:
+  batch_size: 8
+  learning_rate: 1e-4
+  num_epochs: 5
+
+# Attention weights
+attention:
+  alpha_v: 0.4
+  alpha_a: 0.3
+  alpha_t: 0.3
+  hidden_dim: 256  # Reduced complexity 
