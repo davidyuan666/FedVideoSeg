@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 class MultimodalVideoQAModel(nn.Module):
     """
-    Main multimodal video question answering model with dynamic attention fusion.
+    简化的多模态视频问答模型 - 仅支持文本生成
     """
     
     def __init__(
@@ -26,7 +26,6 @@ class MultimodalVideoQAModel(nn.Module):
         hidden_dim: int = 512,
         num_heads: int = 8,
         num_layers: int = 6,
-        num_classes: int = 1000,  # For answer classification
         dropout: float = 0.1,
         alpha_v: float = 0.4,
         alpha_a: float = 0.3,
@@ -35,12 +34,9 @@ class MultimodalVideoQAModel(nn.Module):
         super().__init__()
         
         self.hidden_dim = hidden_dim
-        self.num_classes = num_classes
+        self.text_dim = text_dim
         
-        # Feature extractor (can be used externally)
-        self.feature_extractor = None  # Will be set externally
-        
-        # Dynamic attention fusion
+        # 保留多模态融合组件
         self.attention_fusion = DynamicAttentionFusion(
             visual_dim=visual_dim,
             audio_dim=audio_dim,
@@ -52,49 +48,32 @@ class MultimodalVideoQAModel(nn.Module):
             alpha_a=alpha_a,
             alpha_t=alpha_t
         )
-        
-        # Temporal attention for video sequences
         self.temporal_attention = TemporalAttention(hidden_dim, num_heads, dropout)
-        
-        # Question-aware attention
         self.question_attention = QuestionAwareAttention(hidden_dim, num_heads, dropout)
-        
-        # Transformer encoder layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            activation='relu',
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
-        
-        # Answer generation/classification heads
-        self.answer_classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, num_classes)
+        self.transformer_encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=num_heads,
+                dim_feedforward=hidden_dim * 4,
+                dropout=dropout,
+                activation='relu',
+                batch_first=True
+            ),
+            num_layers
         )
         
-        # Answer generation (for open-ended questions)
+        # 只保留答案生成器
         self.answer_generator = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, text_dim)  # Generate text embeddings
-        )
-        
-        # Question type classifier
-        self.question_type_classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 4, 4)  # factual, conceptual, analytical, other
+            nn.Linear(hidden_dim, text_dim)  # 生成文本嵌入
         )
         
-        # Confidence estimator
+        # 可选：保留置信度估计器
         self.confidence_estimator = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 4),
             nn.ReLU(),
@@ -109,37 +88,29 @@ class MultimodalVideoQAModel(nn.Module):
         audio_features: torch.Tensor,
         text_features: torch.Tensor,
         question_features: torch.Tensor,
-        answer_labels: Optional[torch.Tensor] = None,
-        task_type: str = "classification"  # "classification" or "generation"
+        answer_embeddings: Optional[torch.Tensor] = None  # 目标答案嵌入
     ) -> Dict[str, torch.Tensor]:
         
-        # Multimodal fusion with dynamic attention
-        fusion_output = self.attention_fusion(
-            visual_features, audio_features, text_features
-        )
+        # 多模态融合
+        fusion_output = self.attention_fusion(visual_features, audio_features, text_features)
+        fused_features = fusion_output['fused_features']
         
-        fused_features = fusion_output['fused_features']  # (batch_size, hidden_dim)
-        
-        # Expand for sequence processing if needed
+        # 时序和问题感知注意力
         if fused_features.dim() == 2:
-            fused_features = fused_features.unsqueeze(1)  # (batch_size, 1, hidden_dim)
+            fused_features = fused_features.unsqueeze(1)
         
-        # Temporal attention (if we have video sequences)
         temporal_output, temporal_attn = self.temporal_attention(fused_features)
+        question_aware_output, qa_attn = self.question_attention(temporal_output, question_features)
         
-        # Question-aware attention
-        question_aware_output, qa_attn = self.question_attention(
-            temporal_output, question_features
-        )
-        
-        # Transformer encoding
+        # Transformer编码
         encoded_features = self.transformer_encoder(question_aware_output)
+        pooled_features = encoded_features.mean(dim=1)
         
-        # Pool the sequence (mean pooling)
-        pooled_features = encoded_features.mean(dim=1)  # (batch_size, hidden_dim)
+        # 生成答案嵌入
+        generated_embeddings = self.answer_generator(pooled_features)
         
-        # Generate outputs based on task type
         outputs = {
+            'generated_embeddings': generated_embeddings,
             'pooled_features': pooled_features,
             'attention_weights': fusion_output['attention_weights'],
             'modality_weights': fusion_output['modality_weights'],
@@ -147,30 +118,13 @@ class MultimodalVideoQAModel(nn.Module):
             'qa_attention': qa_attn
         }
         
-        if task_type == "classification":
-            # Answer classification
-            answer_logits = self.answer_classifier(pooled_features)
-            outputs['answer_logits'] = answer_logits
-            
-            if answer_labels is not None:
-                loss = F.cross_entropy(answer_logits, answer_labels)
-                outputs['loss'] = loss
-                
-        elif task_type == "generation":
-            # Answer generation
-            generated_embeddings = self.answer_generator(pooled_features)
-            outputs['generated_embeddings'] = generated_embeddings
-            
-            if answer_labels is not None:
-                # MSE loss for embedding generation
-                loss = F.mse_loss(generated_embeddings, answer_labels)
-                outputs['loss'] = loss
+        # 计算损失（如果提供目标嵌入）
+        if answer_embeddings is not None:
+            # 使用余弦相似度损失或MSE损失
+            loss = F.mse_loss(generated_embeddings, answer_embeddings)
+            outputs['loss'] = loss
         
-        # Question type classification
-        question_type_logits = self.question_type_classifier(pooled_features)
-        outputs['question_type_logits'] = question_type_logits
-        
-        # Confidence estimation
+        # 置信度估计
         confidence = self.confidence_estimator(pooled_features)
         outputs['confidence'] = confidence
         

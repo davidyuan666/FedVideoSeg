@@ -13,6 +13,7 @@ import pickle
 import gzip
 from collections import OrderedDict
 import flwr as fl
+import torch.nn.functional as F
 
 from ..models.multimodal_model import MultimodalVideoQAModel
 from ..privacy.differential_privacy import DifferentialPrivacyManager
@@ -184,8 +185,7 @@ class FedVideoQAClient(fl.client.NumPyClient):
                     audio_features=batch['audio_features'],
                     text_features=batch['text_features'],
                     question_features=batch['question_features'],
-                    answer_labels=batch['answer_labels'],
-                    task_type="classification"
+                    answer_embeddings=batch['answer_embeddings']
                 )
                 
                 loss = outputs['loss']
@@ -205,9 +205,11 @@ class FedVideoQAClient(fl.client.NumPyClient):
                 
                 # Metrics
                 epoch_loss += loss.item()
-                predictions = torch.argmax(outputs['answer_logits'], dim=-1)
-                epoch_correct += (predictions == batch['answer_labels']).sum().item()
-                epoch_samples += batch['answer_labels'].size(0)
+                similarity = F.cosine_similarity(
+                    outputs['generated_embeddings'], 
+                    batch['answer_embeddings']
+                ).mean()
+                epoch_samples += batch['answer_embeddings'].size(0)
                 
                 # Log progress
                 if batch_idx % 10 == 0:
@@ -221,10 +223,10 @@ class FedVideoQAClient(fl.client.NumPyClient):
             
             # Epoch metrics
             epoch_loss /= len(self.data_loader.train_loader)
-            epoch_accuracy = epoch_correct / epoch_samples
+            epoch_accuracy = similarity
             
             total_loss += epoch_loss
-            total_correct += epoch_correct
+            total_correct += similarity
             total_samples += epoch_samples
             
             logger.info(
@@ -270,17 +272,11 @@ class FedVideoQAClient(fl.client.NumPyClient):
                     audio_features=batch['audio_features'],
                     text_features=batch['text_features'],
                     question_features=batch['question_features'],
-                    answer_labels=batch['answer_labels'],
-                    task_type="classification"
+                    answer_embeddings=batch['answer_embeddings']
                 )
                 
                 loss = outputs['loss']
                 total_loss += loss.item()
-                
-                # Predictions
-                predictions = torch.argmax(outputs['answer_logits'], dim=-1)
-                total_correct += (predictions == batch['answer_labels']).sum().item()
-                total_samples += batch['answer_labels'].size(0)
                 
                 # Confidence scores
                 confidence_scores.extend(outputs['confidence'].cpu().numpy().flatten())
@@ -289,13 +285,12 @@ class FedVideoQAClient(fl.client.NumPyClient):
                 modality_weights_list.append(outputs['modality_weights'].cpu().numpy())
         
         avg_loss = total_loss / len(self.data_loader.test_loader)
-        accuracy = total_correct / total_samples
         avg_confidence = np.mean(confidence_scores)
         avg_modality_weights = np.mean(np.vstack(modality_weights_list), axis=0)
         
         return {
             "test_loss": avg_loss,
-            "test_accuracy": accuracy,
+            "test_accuracy": avg_confidence,
             "confidence_score": avg_confidence,
             "modality_weights": avg_modality_weights.tolist()
         }
@@ -366,4 +361,17 @@ class FedVideoQAClient(fl.client.NumPyClient):
         self.scheduler.load_state_dict(state["scheduler_state_dict"])
         self.training_history = state["training_history"]
         
-        logger.info(f"Client {self.client_id}: State loaded from {load_path}") 
+        logger.info(f"Client {self.client_id}: State loaded from {load_path}")
+
+def evaluate_generation_quality(generated_embeddings, target_embeddings, answer_texts):
+    # 余弦相似度
+    cosine_sim = F.cosine_similarity(generated_embeddings, target_embeddings).mean()
+    
+    # 可选：转换回文本并计算BLEU等指标
+    # generated_texts = embedding_to_text(generated_embeddings)
+    # bleu_score = compute_bleu(generated_texts, answer_texts)
+    
+    return {
+        'cosine_similarity': cosine_sim.item(),
+        'confidence': confidence.mean().item()
+    } 
