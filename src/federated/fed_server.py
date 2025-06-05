@@ -12,7 +12,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-class SimpleFedStrategy(FedAvg):
+class FedServer(FedAvg):
     """
     Simple federated averaging strategy
     """

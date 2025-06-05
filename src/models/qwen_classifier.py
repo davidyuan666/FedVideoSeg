@@ -1,5 +1,5 @@
 """
-Simplified Qwen2.5-VL Frame Relevance Classifier
+Qwen2.5-VL Frame Relevance Classifier
 Fine-tunes Qwen2.5-VL for binary frame-question relevance classification
 """
 
@@ -11,9 +11,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-class SimpleQwenFrameClassifier(nn.Module):
+class QwenFrameClassifier(nn.Module):
     """
-    Simple frame relevance classifier using Qwen2.5-VL
+    Qwen2.5-VL Frame Relevance Classifier
     Binary classification: can this frame answer the question?
     """
     

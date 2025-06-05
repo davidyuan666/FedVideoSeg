@@ -11,8 +11,9 @@ import flwr as fl
 import numpy as np
 from typing import List, Tuple, Dict, Any
 import logging
+import time
 
-from ..models.simple_qwen_classifier import SimpleQwenFrameClassifier
+from ..models.qwen_classifier import SimpleQwenFrameClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ class FrameRelevanceDataset(Dataset):
         frame, question, label = self.data[idx]
         return frame, question, torch.tensor(label, dtype=torch.long)
 
-class SimpleFedClient(fl.client.NumPyClient):
+class FedClient(fl.client.NumPyClient):
     """
     Simple federated client for Qwen2.5-VL fine-tuning
     """
@@ -123,32 +124,44 @@ class SimpleFedClient(fl.client.NumPyClient):
         return updated_params, len(self.dataset), metrics
     
     def evaluate(self, parameters: List[np.ndarray], config: Dict[str, Any]) -> Tuple[float, int, Dict[str, Any]]:
-        """Local evaluation"""
+        """Local evaluation with simple metrics"""
         self.set_parameters(parameters)
         
         self.model.eval()
         total_loss = 0.0
-        correct = 0
-        total = 0
+        predictions = []
+        true_labels = []
+        response_times = []
         
         with torch.no_grad():
-            for frames, questions, labels in self.train_loader:  # Use train_loader as test for simplicity
+            for frames, questions, labels in self.train_loader:
                 labels = labels.to(self.device)
                 
+                # Measure response time
+                start_time = time.time()
                 logits = self.model(frames, questions)
-                loss = self.criterion(logits, labels)
+                response_time = (time.time() - start_time) * 1000  # Convert to ms
+                response_times.append(response_time)
                 
+                loss = self.criterion(logits, labels)
                 total_loss += loss.item()
+                
+                # Collect predictions and labels
                 _, predicted = torch.max(logits.data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
+                predictions.extend(predicted.cpu().numpy())
+                true_labels.extend(labels.cpu().numpy())
         
-        accuracy = correct / total if total > 0 else 0.0
+        # Calculate simple metrics
+        accuracy = sum(p == l for p, l in zip(predictions, true_labels)) / len(true_labels) * 100
         avg_loss = total_loss / len(self.train_loader)
+        avg_response_time = sum(response_times) / len(response_times)
         
         metrics = {
             "test_accuracy": accuracy,
-            "test_loss": avg_loss
+            "test_loss": avg_loss,
+            "avg_response_time_ms": avg_response_time,
+            "device_type": self.device_type,
+            "num_samples": len(true_labels)
         }
         
         return avg_loss, len(self.dataset), metrics 

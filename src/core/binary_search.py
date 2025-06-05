@@ -11,9 +11,9 @@ import time
 
 logger = logging.getLogger(__name__)
 
-class SimpleBinarySearchLocalizer:
+class BinarySearchLocalizer:
     """
-    Simple binary search for video segment localization
+    Binary search for video segment localization
     Reduces complexity from O(T) to O(log T)
     """
     

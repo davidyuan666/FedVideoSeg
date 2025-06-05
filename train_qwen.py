@@ -1,6 +1,6 @@
 """
-Simplified Training Script for FedVideoQA
-Focus on binary search + Qwen2.5-VL fine-tuning + federated learning
+Training Script for FedVideoQA
+binary search + Qwen2.5-VL fine-tuning + federated learning
 """
 
 import argparse
@@ -9,10 +9,10 @@ import flwr as fl
 from pathlib import Path
 from typing import List, Tuple
 
-from src.core.simple_binary_search import SimpleBinarySearchLocalizer
+from src.core.binary_search import SimpleBinarySearchLocalizer
 from src.core.deepseek_client import DeepSeekClient
-from src.federated.simple_fed_client import SimpleFedClient
-from src.federated.simple_fed_server import SimpleFedStrategy
+from src.federated.fed_client import SimpleFedClient
+from src.federated.fed_server import SimpleFedStrategy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
