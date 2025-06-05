@@ -16,7 +16,7 @@ from datetime import datetime
 from src.core.binary_search import BinarySearchLocalizer
 from src.core.deepseek_client import DeepSeekClient
 from src.federated.fed_client import FedClient
-from src.federated.fed_server import FedStrategy
+from src.federated.fed_server import FedServer
 
 # 配置日志
 logging.basicConfig(
@@ -39,7 +39,7 @@ class FedVideoQALauncher:
         
         # 初始化组件
         self.deepseek_client = DeepSeekClient()
-        self.localizer = SimpleBinarySearchLocalizer(self.deepseek_client)
+        self.localizer = BinarySearchLocalizer(self.deepseek_client)
         
     def load_dataset(self) -> List[Tuple[str, str]]:
         """加载视频数据集"""
@@ -128,7 +128,26 @@ class FedVideoQALauncher:
             local_data = client_data.get(cid, [])
             device_type = "mobile" if "0" in cid or "3" in cid or "6" in cid else "desktop"
             
-            return SimpleFedClient(cid, local_data, device_type)
+            return FedClient(
+                client_id=cid, 
+                local_data=local_data, 
+                device_type=device_type,
+                training_mode=self.config.get('training_mode', 'finetune'),
+                model_name=self.config.get('model_name', 'Qwen/Qwen2.5-VL-7B-Instruct'),
+                tuner_configs={
+                    "lora": {
+                        "r": self.config.get('lora_r', 16),
+                        "lora_alpha": self.config.get('lora_alpha', 32),
+                        "target_modules": self.config.get('lora_targets', ["q_proj", "v_proj"]),
+                        "lora_dropout": self.config.get('lora_dropout', 0.1)
+                    },
+                    "training": {
+                        "local_epochs": self.config.get('local_epochs', 3),
+                        "batch_size": self.config.get('batch_size', 4),
+                        "learning_rate": self.config.get('learning_rate', 1e-4)
+                    }
+                }
+            )
         
         return client_fn
     
@@ -136,13 +155,19 @@ class FedVideoQALauncher:
         """启动联邦学习训练"""
         logger.info("启动联邦学习训练...")
         
-        # 创建联邦学习策略
-        strategy = SimpleFedStrategy(
+        # 创建增强的联邦学习策略
+        strategy = FedServer(
             fraction_fit=self.config.get('fraction_fit', 0.8),
             fraction_evaluate=self.config.get('fraction_evaluate', 0.5),
             min_fit_clients=self.config.get('min_fit_clients', 3),
             min_evaluate_clients=self.config.get('min_evaluate_clients', 3),
             min_available_clients=self.config.get('min_available_clients', 3),
+            training_mode=self.config.get('training_mode', 'finetune'),
+            model_save_path=self.config.get('model_save_path', './global_models'),
+            convergence_threshold=self.config.get('convergence_threshold', 0.001),
+            convergence_patience=self.config.get('convergence_patience', 5),
+            client_selection_strategy=self.config.get('client_selection_strategy', 'random'),
+            adaptive_lr=self.config.get('adaptive_lr', True)
         )
         
         # 配置客户端资源
@@ -153,12 +178,15 @@ class FedVideoQALauncher:
         
         # 启动联邦学习仿真
         try:
+            logger.info(f"启动 {self.config['num_clients']} 个客户端，运行 {self.config['num_rounds']} 轮训练")
+            
             history = fl.simulation.start_simulation(
                 client_fn=self.create_client_fn(client_data),
                 num_clients=self.config['num_clients'],
                 config=fl.server.ServerConfig(num_rounds=self.config['num_rounds']),
                 strategy=strategy,
-                client_resources=client_resources
+                client_resources=client_resources,
+                ray_init_args={"include_dashboard": False}  # 禁用Ray dashboard以避免端口冲突
             )
             
             logger.info("联邦学习训练完成！")
@@ -167,11 +195,27 @@ class FedVideoQALauncher:
             results = {
                 "training_history": {
                     "losses": dict(history.losses_distributed) if history.losses_distributed else {},
-                    "metrics": dict(history.metrics_distributed) if history.metrics_distributed else {}
+                    "metrics": dict(history.metrics_distributed) if history.metrics_distributed else {},
+                    "losses_centralized": dict(history.losses_centralized) if history.losses_centralized else {},
+                    "metrics_centralized": dict(history.metrics_centralized) if history.metrics_centralized else {}
                 },
-                "round_metrics": strategy.round_metrics,
+                "round_metrics": getattr(strategy, 'round_metrics', []),
+                "global_metrics": getattr(strategy, 'global_metrics', {}),
+                "final_performance": {
+                    "best_accuracy": getattr(strategy, 'global_metrics', {}).get('best_accuracy', 0.0),
+                    "total_rounds": self.config['num_rounds'],
+                    "convergence_round": getattr(strategy, 'global_metrics', {}).get('convergence_round'),
+                    "converged": getattr(strategy, 'converged', False)
+                },
                 "config": self.config
             }
+            
+            # 保存全局模型
+            if hasattr(strategy, 'save_global_model'):
+                model_path = f"global_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
+                strategy.save_global_model(model_path)
+                results["model_path"] = model_path
+                logger.info(f"全局模型已保存到: {model_path}")
             
             return results
             
@@ -190,17 +234,30 @@ class FedVideoQALauncher:
             
             logger.info(f"训练结果已保存到: {results_file}")
             
+            # 输出关键指标摘要
+            final_perf = results.get("final_performance", {})
+            logger.info("=== 训练结果摘要 ===")
+            logger.info(f"最佳准确率: {final_perf.get('best_accuracy', 0):.4f}")
+            logger.info(f"总训练轮数: {final_perf.get('total_rounds', 0)}")
+            logger.info(f"收敛轮次: {final_perf.get('convergence_round', '未收敛')}")
+            logger.info(f"是否收敛: {'是' if final_perf.get('converged', False) else '否'}")
+            
         except Exception as e:
             logger.error(f"保存结果失败: {e}")
     
     def run(self) -> None:
         """运行完整的联邦学习流程"""
         logger.info("=== FedVideoQA 联邦学习框架启动 ===")
+        logger.info(f"配置参数: {json.dumps(self.config, indent=2, ensure_ascii=False)}")
         
         try:
             # 步骤1: 加载数据集
             logger.info("步骤1: 加载视频数据集")
             video_question_pairs = self.load_dataset()
+            
+            if not video_question_pairs:
+                logger.error("没有加载到任何视频数据，退出")
+                return
             
             # 步骤2: 生成训练数据
             logger.info("步骤2: 使用二分搜索生成训练数据")
@@ -214,6 +271,10 @@ class FedVideoQALauncher:
             logger.info("步骤3: 分发数据到联邦客户端")
             client_data = self.distribute_data_to_clients(training_data)
             
+            # 验证客户端数据分发
+            total_samples = sum(len(data) for data in client_data.values())
+            logger.info(f"总共分发了 {total_samples} 个样本到 {len(client_data)} 个客户端")
+            
             # 步骤4: 启动联邦学习
             logger.info("步骤4: 启动联邦学习训练")
             results = self.start_federated_training(client_data)
@@ -226,6 +287,8 @@ class FedVideoQALauncher:
             
         except Exception as e:
             logger.error(f"联邦学习流程失败: {e}")
+            import traceback
+            traceback.print_exc()
             raise
 
 def create_default_config() -> Dict[str, Any]:
@@ -248,10 +311,27 @@ def create_default_config() -> Dict[str, Any]:
         "client_cpus": 1,
         "client_gpus": 0.5,
         
+        # 模型配置
+        "model_name": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "training_mode": "finetune",
+        "model_save_path": "./global_models",
+        
+        # LoRA配置
+        "lora_r": 16,
+        "lora_alpha": 32,
+        "lora_targets": ["q_proj", "v_proj", "k_proj", "o_proj"],
+        "lora_dropout": 0.1,
+        
         # 训练配置
         "local_epochs": 3,
         "batch_size": 4,
         "learning_rate": 1e-4,
+        
+        # 策略配置
+        "convergence_threshold": 0.001,
+        "convergence_patience": 5,
+        "client_selection_strategy": "random",
+        "adaptive_lr": True,
     }
 
 def main():
