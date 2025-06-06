@@ -469,7 +469,7 @@ class UnifiedTrainer:
         self.save_model()
     
     def collate_fn(self, batch):
-        """改进的批处理函数，正确处理变长序列"""
+        """改进的批处理函数，正确处理变长序列和图像数据"""
         # 分离不同类型的数据
         batch_dict = {}
         
@@ -516,28 +516,54 @@ class UnifiedTrainer:
                     # 长度相同，直接堆叠
                     batch_dict[key] = torch.stack(sequences)
         
-        # 处理其他tensor类型的数据
+        # 处理其他tensor类型的数据，特别是图像数据
         for key in batch[0].keys():
             if key not in batch_dict:
                 values = [item[key] for item in batch]
                 
                 # 检查是否都是tensor
                 if all(isinstance(v, torch.Tensor) for v in values):
-                    try:
-                        # 对于图像相关的tensor，应该形状一致，直接堆叠
-                        if key.startswith('pixel_values') or key == 'image_patches':
-                            batch_dict[key] = torch.stack(values)
+                    # 特殊处理pixel_values - 需要padding到相同的序列长度
+                    if key == 'pixel_values':
+                        # 检查是否需要padding
+                        seq_lengths = [v.shape[0] for v in values]  # 第一维是序列长度（patch数量）
+                        
+                        if len(set(seq_lengths)) > 1:  # 长度不同，需要padding
+                            max_len = max(seq_lengths)
+                            padded_values = []
+                            
+                            for v in values:
+                                if v.shape[0] < max_len:
+                                    # 在第一维度进行padding，用0填充
+                                    pad_size = max_len - v.shape[0]
+                                    # 创建与v后续维度相同的零张量
+                                    pad_shape = (pad_size,) + v.shape[1:]
+                                    pad_tensor = torch.zeros(pad_shape, dtype=v.dtype, device=v.device)
+                                    padded_v = torch.cat([v, pad_tensor], dim=0)
+                                else:
+                                    padded_v = v
+                                padded_values.append(padded_v)
+                            
+                            batch_dict[key] = torch.stack(padded_values)
                         else:
-                            # 其他tensor类型，尝试堆叠
+                            # 长度相同，直接堆叠
                             batch_dict[key] = torch.stack(values)
-                    except Exception as e:
-                        # 如果是关键的图像数据堆叠失败，抛出错误
-                        if key.startswith('pixel_values') or key == 'image_patches':
-                            logger.error(f"Failed to stack {key}: {e}")
-                            logger.error(f"Tensor shapes: {[v.shape for v in values]}")
-                            raise RuntimeError(f"Critical tensor {key} cannot be stacked")
-                        else:
-                            # 其他数据保持为列表
+                    
+                    # 处理其他图像相关的tensor
+                    elif key.startswith('image_') or key == 'image_patches':
+                        try:
+                            batch_dict[key] = torch.stack(values)
+                        except Exception as e:
+                            logger.warning(f"Cannot stack {key}: {e}, keeping as list")
+                            batch_dict[key] = values
+                    
+                    # 处理其他tensor类型
+                    else:
+                        try:
+                            batch_dict[key] = torch.stack(values)
+                        except Exception as e:
+                            # 如果无法堆叠，保持为列表
+                            logger.debug(f"Cannot stack {key}: {e}, keeping as list")
                             batch_dict[key] = values
                 else:
                     # 非tensor数据保持为列表
