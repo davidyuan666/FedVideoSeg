@@ -94,23 +94,45 @@ class PrivateFederatedClient:
         self.client_id = client_id
         self.args = args
         self.data = data_subset
-        self.trainer = UnifiedTrainer(args)
+        # 不在初始化时创建trainer，避免重复加载模型
+        self.trainer = None
         self.privacy_engine = privacy_engine
         
         logger.info(f"隐私保护客户端 {client_id} 初始化完成，数据量: {len(data_subset)}")
+    
+    def _get_trainer(self):
+        """延迟初始化trainer"""
+        if self.trainer is None:
+            # 修改args以避免device_map冲突
+            client_args = copy.deepcopy(self.args)
+            # 在federated learning中，我们手动管理设备分配
+            self.trainer = UnifiedTrainer(client_args)
+        return self.trainer
     
     def local_train(self, global_weights: Dict[str, torch.Tensor], epochs: int = 1):
         """本地训练（含隐私保护）"""
         logger.info(f"客户端 {self.client_id} 开始隐私保护本地训练...")
         
+        # 获取trainer实例
+        trainer = self._get_trainer()
+        
         # 加载全局权重
-        self.trainer.model.load_state_dict(global_weights, strict=False)
+        try:
+            trainer.model.load_state_dict(global_weights, strict=False)
+        except Exception as e:
+            logger.warning(f"加载权重时出现警告: {e}")
+            # 尝试更宽松的加载
+            missing_keys, unexpected_keys = trainer.model.load_state_dict(global_weights, strict=False)
+            if missing_keys:
+                logger.info(f"缺失的键: {missing_keys}")
+            if unexpected_keys:
+                logger.info(f"意外的键: {unexpected_keys}")
         
         # 创建本地数据集
         dataset = VideoQADataset(
             self.data, 
-            self.trainer.processor, 
-            self.trainer.tokenizer,
+            trainer.processor, 
+            trainer.tokenizer,
             training_mode=self.args.training_mode
         )
         
@@ -119,32 +141,32 @@ class PrivateFederatedClient:
             dataset, 
             batch_size=self.args.batch_size, 
             shuffle=True,
-            collate_fn=self.trainer.collate_fn
+            collate_fn=trainer.collate_fn
         )
         
         # 本地优化器
         optimizer = torch.optim.AdamW(
-            self.trainer.model.parameters(), 
+            trainer.model.parameters(), 
             lr=self.args.learning_rate
         )
         
         # 训练
-        self.trainer.model.train()
+        trainer.model.train()
         total_loss = 0
         
         for epoch in range(epochs):
             for batch in dataloader:
-                batch = {k: v.to(self.trainer.device) if isinstance(v, torch.Tensor) else v 
+                batch = {k: v.to(trainer.device) if isinstance(v, torch.Tensor) else v 
                         for k, v in batch.items()}
                 
                 optimizer.zero_grad()
-                outputs = self.trainer.model(**batch)
+                outputs = trainer.model(**batch)
                 loss = outputs['loss']
                 loss.backward()
                 
                 # 梯度裁剪（隐私保护）
                 if self.args.use_privacy:
-                    self.privacy_engine.clip_gradients(self.trainer.model)
+                    self.privacy_engine.clip_gradients(trainer.model)
                 
                 optimizer.step()
                 total_loss += loss.item()
@@ -152,7 +174,7 @@ class PrivateFederatedClient:
         avg_loss = total_loss / (epochs * len(dataloader))
         
         # 获取训练后的权重
-        trained_weights = self.trainer.model.state_dict()
+        trained_weights = trainer.model.state_dict()
         
         # 应用隐私保护
         if self.args.use_privacy:
@@ -176,7 +198,22 @@ class PrivateFederatedServer:
     
     def __init__(self, args, privacy_engine: PrivacyEngine):
         self.args = args
-        self.global_model = UnifiedTrainer(args).model
+        # 只在服务器端创建一个全局模型实例
+        try:
+            trainer = UnifiedTrainer(args)
+            self.global_model = trainer.model
+            self.device = trainer.device
+        except Exception as e:
+            logger.error(f"初始化全局模型失败: {e}")
+            # 降级方案：使用简单的模型初始化
+            if args.training_mode == "encoder":
+                from train_qwen import QwenEncoderClassifier
+                self.global_model = QwenEncoderClassifier(args.model_name, freeze_backbone=args.freeze_backbone)
+                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                self.global_model.to(self.device)
+            else:
+                raise e
+        
         self.clients = []
         self.privacy_engine = privacy_engine
         

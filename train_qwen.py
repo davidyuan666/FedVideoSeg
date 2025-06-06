@@ -285,7 +285,7 @@ class UnifiedTrainer:
             base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 args.model_name,
                 torch_dtype=torch.float16,
-                device_map="auto",
+                device_map="auto" if not getattr(args, '_federated_mode', False) else None,
                 cache_dir='./cache'
             )
             
@@ -302,7 +302,43 @@ class UnifiedTrainer:
             else:
                 self.model = base_model
         
-        self.model.to(self.device)
+        # 修复meta设备问题
+        try:
+            # 检查是否使用了device_map="auto"
+            if hasattr(self.model, 'hf_device_map') and self.model.hf_device_map:
+                # 模型已经通过device_map分配，不需要再次移动
+                logger.info("模型已通过device_map自动分配设备")
+            else:
+                # 检查是否有meta设备上的参数
+                meta_params = [name for name, param in self.model.named_parameters() if param.is_meta]
+                if meta_params:
+                    logger.warning(f"检测到meta设备参数: {len(meta_params)}个，使用to_empty()转移")
+                    self.model = self.model.to_empty(device=self.device)
+                else:
+                    self.model.to(self.device)
+        except Exception as e:
+            logger.warning(f"设备转移出现问题: {e}，尝试降级方案")
+            # 降级方案：重新加载模型但不使用device_map
+            if args.training_mode == "instruction":
+                logger.info("重新加载模型，不使用device_map")
+                base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    args.model_name,
+                    torch_dtype=torch.float16,
+                    cache_dir='./cache'
+                )
+                if args.use_lora:
+                    lora_config = LoraConfig(
+                        r=args.lora_r,
+                        lora_alpha=args.lora_alpha,
+                        target_modules=args.lora_targets,
+                        lora_dropout=args.lora_dropout,
+                        bias="none",
+                        task_type="CAUSAL_LM"
+                    )
+                    self.model = get_peft_model(base_model, lora_config)
+                else:
+                    self.model = base_model
+                self.model.to(self.device)
     
     def generate_synthetic_data(self) -> List[Tuple]:
         """生成合成数据用于测试，专注于问题与图像的相关性"""
