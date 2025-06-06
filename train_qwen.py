@@ -595,7 +595,7 @@ class UnifiedTrainer:
 
 def parse_args():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(description="FedVideoQA Qwen训练脚本")
+    parser = argparse.ArgumentParser(description="FedVideoSeg Qwen训练脚本")
     
     # 基本参数
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct",
@@ -641,7 +641,7 @@ def main():
     args = parse_args()
     
     logger.info("="*50)
-    logger.info("FedVideoQA Qwen训练脚本启动")
+    logger.info("FedVideoSeg Qwen训练脚本启动")
     logger.info(f"训练模式: {args.training_mode}")
     logger.info(f"模型: {args.model_name}")
     logger.info(f"数据文件: {args.data_file}")
