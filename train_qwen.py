@@ -419,17 +419,58 @@ class UnifiedTrainer:
         self.save_model()
     
     def collate_fn(self, batch):
-        """批处理函数"""
+        """改进的批处理函数，正确处理变长序列"""
+        # 分离不同类型的数据
         batch_dict = {}
-        for key in batch[0].keys():
-            if key in ['labels', 'target_token_id']:
+        
+        # 处理标签和target_token_id - 这些可以直接堆叠
+        for key in ['labels', 'target_token_id']:
+            if key in batch[0]:
                 batch_dict[key] = torch.stack([item[key] for item in batch])
-            else:
-                # 对于其他输入，尝试堆叠
+        
+        # 对于需要padding的序列数据，使用tokenizer的pad功能
+        sequence_keys = ['input_ids', 'attention_mask']
+        for key in sequence_keys:
+            if key in batch[0]:
+                sequences = [item[key] for item in batch]
+                # 手动pad序列到相同长度
+                max_len = max(len(seq) for seq in sequences)
+                padded_sequences = []
+                
+                for seq in sequences:
+                    if key == 'input_ids':
+                        # 使用tokenizer的pad_token_id进行padding
+                        pad_token_id = self.tokenizer.pad_token_id
+                        if pad_token_id is None:
+                            pad_token_id = self.tokenizer.eos_token_id
+                        padded = torch.nn.functional.pad(seq, (0, max_len - len(seq)), value=pad_token_id)
+                    else:  # attention_mask
+                        # attention_mask用0进行padding
+                        padded = torch.nn.functional.pad(seq, (0, max_len - len(seq)), value=0)
+                    padded_sequences.append(padded)
+                
+                batch_dict[key] = torch.stack(padded_sequences)
+        
+        # 处理其他tensor类型的数据
+        for key in batch[0].keys():
+            if key not in batch_dict:
                 try:
-                    batch_dict[key] = torch.stack([item[key] for item in batch])
-                except:
+                    values = [item[key] for item in batch]
+                    # 检查是否都是tensor并且形状兼容
+                    if all(isinstance(v, torch.Tensor) for v in values):
+                        # 对于图像相关的tensor，应该形状一致
+                        if key.startswith('pixel_values') or key == 'image_patches':
+                            batch_dict[key] = torch.stack(values)
+                        else:
+                            # 其他tensor类型，尝试堆叠
+                            batch_dict[key] = torch.stack(values)
+                    else:
+                        # 非tensor数据保持为列表
+                        batch_dict[key] = values
+                except Exception as e:
+                    # 如果堆叠失败，保持为列表
                     batch_dict[key] = [item[key] for item in batch]
+        
         return batch_dict
     
     def save_model(self):
