@@ -87,42 +87,84 @@ class DeepSeekClient:
             return 0.5
 
 class CLIPFrameAnalyzer:
-    """使用CLIP分析视频帧"""
+    """使用CLIP和图像描述生成模型分析视频帧"""
     
     def __init__(self, model_name: str = "openai/clip-vit-base-patch32"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = CLIPModel.from_pretrained(model_name)
-        self.processor = CLIPProcessor.from_pretrained(model_name)
+        self.model = CLIPModel.from_pretrained(model_name, cache_dir='cache')
+        self.processor = CLIPProcessor.from_pretrained(model_name, cache_dir='cache')
         self.model.to(self.device)
         
-        # 预定义的描述模板
-        self.descriptions = [
-            "一个人在说话或演讲",
-            "多个人在交谈或讨论", 
-            "会议或正式讨论场景",
-            "演示或展示内容",
-            "教学或培训场景",
-            "工作或办公环境",
-            "室内正式场合",
-            "户外活动场景",
-            "技术或产品展示",
-            "问答或互动环节",
-            "文档或屏幕内容",
-            "图表或数据展示"
-        ]
+        # 初始化图像描述生成模型
+        try:
+            from transformers import BlipProcessor, BlipForConditionalGeneration
+            self.caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base", cache_dir='cache')
+            self.caption_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base", cache_dir='cache')
+            self.caption_model.to(self.device)
+            self.use_blip = True
+            logger.info("BLIP图像描述模型已加载")
+        except ImportError:
+            logger.warning("BLIP模型不可用，将使用增强的CLIP分析")
+            self.use_blip = False
         
         logger.info(f"CLIP模型已加载: {model_name}")
     
-    def describe_frame(self, frame: np.ndarray) -> str:
-        """使用CLIP生成帧的描述"""
+    def describe_frame_with_blip(self, frame: np.ndarray) -> str:
+        """使用BLIP模型生成帧的开放式描述"""
         try:
             # 转换为PIL图像
             if isinstance(frame, np.ndarray):
                 frame = Image.fromarray(frame)
             
+            # 使用BLIP生成描述
+            inputs = self.caption_processor(frame, return_tensors="pt").to(self.device)
+            
+            with torch.no_grad():
+                out = self.caption_model.generate(**inputs, max_length=50, num_beams=5)
+            
+            caption = self.caption_processor.decode(out[0], skip_special_tokens=True)
+            
+            logger.debug(f"BLIP帧描述: {caption}")
+            return caption
+            
+        except Exception as e:
+            logger.error(f"BLIP分析帧失败: {e}")
+            return self._fallback_describe(frame)
+    
+    def _fallback_describe(self, frame: np.ndarray) -> str:
+        """增强的CLIP描述方法：使用更详细的场景分析"""
+        try:
+            # 转换为PIL图像
+            if isinstance(frame, np.ndarray):
+                frame = Image.fromarray(frame)
+            
+            # 使用更详细和具体的描述模板
+            detailed_descriptions = [
+                "a person cooking food in a kitchen with pots and pans",
+                "people eating a meal together at a dining table", 
+                "someone talking on a mobile phone or device",
+                "people having a conversation in a living room",
+                "a person working at a desk with a computer",
+                "people watching television in a comfortable room",
+                "someone cleaning or organizing household items",
+                "people exercising or doing physical activities",
+                "a person reading a book or studying materials",
+                "people playing games or socializing together",
+                "outdoor activities in a natural environment",
+                "street scenes with cars and pedestrians",
+                "shopping activities in a store or market",
+                "business meeting or educational discussion",
+                "family gathering or celebration event",
+                "kitchen activities with food preparation",
+                "bedroom or private room activities",
+                "bathroom or personal care activities",
+                "garden or outdoor home activities",
+                "workshop or garage activities"
+            ]
+            
             # 处理图像和文本
             inputs = self.processor(
-                text=self.descriptions,
+                text=detailed_descriptions,
                 images=frame,
                 return_tensors="pt",
                 padding=True
@@ -135,22 +177,47 @@ class CLIPFrameAnalyzer:
                 logits_per_image = outputs.logits_per_image
                 probs = logits_per_image.softmax(dim=-1)
             
-            # 选择最相关的描述
+            # 选择置信度最高的描述
             best_idx = probs.argmax().item()
             confidence = probs[0][best_idx].item()
             
-            best_description = self.descriptions[best_idx]
+            best_description = detailed_descriptions[best_idx]
             
-            # 如果置信度较低，使用通用描述
-            if confidence < 0.2:
-                best_description = "视频场景内容"
+            # 如果置信度较低，尝试组合描述
+            if confidence < 0.15:
+                # 获取前3个候选并组合
+                top_k = 3
+                top_indices = probs[0].topk(top_k).indices
+                top_probs = probs[0].topk(top_k).values
+                
+                description_parts = []
+                for idx, prob in zip(top_indices, top_probs):
+                    if prob > 0.08:  # 较低的阈值
+                        desc = detailed_descriptions[idx]
+                        # 提取关键词
+                        key_words = desc.split()[:3]  # 取前3个词作为关键描述
+                        description_parts.extend(key_words)
+                
+                if description_parts:
+                    best_description = " ".join(description_parts[:5])  # 组合前5个关键词
+                else:
+                    best_description = "indoor daily life scene"
             
-            logger.debug(f"帧描述: {best_description} (置信度: {confidence:.3f})")
+            logger.debug(f"增强CLIP帧描述: {best_description} (置信度: {confidence:.3f})")
             return best_description
-            
+                
         except Exception as e:
-            logger.error(f"CLIP分析帧失败: {e}")
-            return "视频场景内容"
+            logger.error(f"增强CLIP分析帧失败: {e}")
+            return "video scene content"
+    
+    def describe_frame(self, frame: np.ndarray, deepseek_client=None) -> str:
+        """生成帧的开放式描述"""
+        # 优先使用BLIP模型进行开放式描述
+        if self.use_blip:
+            return self.describe_frame_with_blip(frame)
+        # 使用增强的CLIP分析
+        else:
+            return self._fallback_describe(frame)
 
 class BinarySearchExtractor:
     """二分法视频关键帧提取器"""
@@ -160,14 +227,13 @@ class BinarySearchExtractor:
         self.deepseek_client = DeepSeekClient(deepseek_api_key)
         self.min_segment_duration = 2.0  # 最小片段时长(秒)
         self.max_frames = 5  # 最大提取帧数
+        self.initial_segment_duration = 5.0  # 初步筛选的片段时长(秒)
+        self.top_segments_for_binary_search = 3  # 选择前N个片段进行二分法搜索
         
         # 预定义问题
         self.predefined_questions = [
-            "视频中的主要讨论内容是什么？",
-            "视频中出现了哪些重要信息？", 
-            "视频的核心观点或结论是什么？",
-            "视频中有哪些关键的演示或展示？",
-            "视频中的重点时刻在哪里？"
+            "when does the man boil milk",
+            "when does the man make cake"
         ]
     
     def extract_frame_at_time(self, video_path: str, timestamp: float) -> np.ndarray:
@@ -207,54 +273,119 @@ class BinarySearchExtractor:
                                  end_time: float, question: str) -> float:
         """评估视频片段与问题的相关性"""
         try:
+            logger.info(f"   🖼️  提取片段首尾帧: [{start_time:.1f}s] 和 [{end_time:.1f}s]")
+            
             # 提取片段首尾帧
             start_frame = self.extract_frame_at_time(video_path, start_time)
             end_frame = self.extract_frame_at_time(video_path, end_time)
             
-            # 获取帧描述
-            start_desc = self.clip_analyzer.describe_frame(start_frame)
-            end_desc = self.clip_analyzer.describe_frame(end_frame)
+            # 获取帧描述（传入deepseek_client以支持更好的描述）
+            start_desc = self.clip_analyzer.describe_frame(start_frame, self.deepseek_client)
+            end_desc = self.clip_analyzer.describe_frame(end_frame, self.deepseek_client)
+            
+            logger.info(f"   📝 帧描述 - 开始帧: {start_desc}")
+            logger.info(f"   📝 帧描述 - 结束帧: {end_desc}")
             
             # 组合描述
             combined_desc = f"片段开始: {start_desc}, 片段结束: {end_desc}"
             
             # 评估相关性
+            logger.info(f"   🤖 正在调用DeepSeek评估相关性...")
             relevance = self.deepseek_client.evaluate_relevance(combined_desc, question)
             
-            logger.debug(f"片段 [{start_time:.1f}-{end_time:.1f}s] 相关性: {relevance:.3f}")
+            logger.info(f"   ⭐ DeepSeek评估结果: {relevance:.3f}")
+            
             return relevance
             
         except Exception as e:
-            logger.error(f"评估片段相关性失败: {e}")
+            logger.error(f"   ❌ 评估片段相关性失败: {e}")
             return 0.0
     
-    def binary_search_segments(self, video_path: str, question: str, 
-                             start_time: float = 0, end_time: float = None) -> List[Tuple[float, float, float]]:
-        """使用二分法搜索相关片段"""
-        if end_time is None:
-            end_time = self.get_video_duration(video_path)
+    def initial_coarse_screening(self, video_path: str, question: str) -> List[Tuple[float, float, float]]:
+        """初步粗筛选：每隔5秒创建片段并评估相关性"""
+        duration = self.get_video_duration(video_path)
+        segments = []
         
+        logger.info(f"🔍 开始初步粗筛选 - 视频总时长: {duration:.1f}s")
+        logger.info(f"📏 片段间隔: {self.initial_segment_duration}s")
+        logger.info(f"📋 问题: {question}")
+        
+        # 创建每隔5秒的片段
+        current_time = 0
+        segment_id = 0
+        
+        while current_time < duration:
+            end_time = min(current_time + self.initial_segment_duration, duration)
+            
+            # 确保片段长度足够
+            if end_time - current_time >= self.min_segment_duration:
+                segment_id += 1
+                
+                logger.info(f"🎯 [粗筛 {segment_id}] 评估片段 [{current_time:.1f}-{end_time:.1f}s] (时长: {end_time-current_time:.1f}s)")
+                
+                # 评估片段相关性
+                relevance = self.evaluate_segment_relevance(video_path, current_time, end_time, question)
+                
+                segments.append((current_time, end_time, relevance))
+                
+                logger.info(f"📊 [粗筛 {segment_id}] 片段 [{current_time:.1f}-{end_time:.1f}s] 相关性分数: {relevance:.3f}")
+                
+                # 避免API调用过于频繁
+                time.sleep(0.3)
+            
+            current_time += self.initial_segment_duration
+        
+        # 按相关性排序
+        segments.sort(key=lambda x: x[2], reverse=True)
+        
+        logger.info(f"🏁 粗筛选完成，共评估 {len(segments)} 个片段")
+        
+        # 显示所有片段的相关性分数
+        if segments:
+            logger.info(f"📋 所有片段相关性排序:")
+            for i, (start, end, score) in enumerate(segments):
+                logger.info(f"   {i+1}. [{start:.1f}-{end:.1f}s] 分数: {score:.3f}")
+        
+        # 选择相关性最高的前几个片段进行二分法搜索
+        top_segments = segments[:self.top_segments_for_binary_search]
+        
+        if top_segments:
+            logger.info(f"🎯 选择前 {len(top_segments)} 个片段进行二分法细化搜索:")
+            for i, (start, end, score) in enumerate(top_segments):
+                logger.info(f"   选中 {i+1}. [{start:.1f}-{end:.1f}s] 分数: {score:.3f}")
+        
+        return top_segments
+
+    def binary_search_on_segment(self, video_path: str, question: str, 
+                                start_time: float, end_time: float) -> List[Tuple[float, float, float]]:
+        """对指定片段进行二分法搜索"""
         segments = []  # (start_time, end_time, relevance_score)
         search_queue = [(start_time, end_time)]
+        search_depth = 0
+        
+        logger.info(f"🔬 对片段 [{start_time:.1f}-{end_time:.1f}s] 开始二分法细化搜索")
         
         while search_queue and len(segments) < self.max_frames:
             current_start, current_end = search_queue.pop(0)
+            search_depth += 1
             
             # 如果片段太短，跳过
             if current_end - current_start < self.min_segment_duration:
+                logger.info(f"⏭️  [二分 {search_depth}] 片段 [{current_start:.1f}-{current_end:.1f}s] 太短，跳过 (< {self.min_segment_duration}s)")
                 continue
             
-            # 评估当前片段的相关性
+            logger.info(f"🎯 [二分 {search_depth}] 评估片段 [{current_start:.1f}-{current_end:.1f}s] (时长: {current_end-current_start:.1f}s)")
+            
             relevance = self.evaluate_segment_relevance(
                 video_path, current_start, current_end, question
             )
             
-            logger.info(f"评估片段 [{current_start:.1f}-{current_end:.1f}s]: 相关性 {relevance:.3f}")
+            logger.info(f"📊 [二分 {search_depth}] 片段 [{current_start:.1f}-{current_end:.1f}s] 相关性分数: {relevance:.3f}")
             
             # 如果相关性高，记录这个片段
             if relevance > 0.6:
                 segments.append((current_start, current_end, relevance))
-                logger.info(f"✓ 找到相关片段: [{current_start:.1f}-{current_end:.1f}s]")
+                logger.info(f"✅ [二分 {search_depth}] 高相关性片段已保存: [{current_start:.1f}-{current_end:.1f}s] (分数: {relevance:.3f})")
             
             # 如果相关性中等，继续二分搜索
             elif relevance > 0.3:
@@ -264,14 +395,78 @@ class BinarySearchExtractor:
                 search_queue.append((current_start, mid_time))
                 search_queue.append((mid_time, current_end))
                 
-                logger.debug(f"继续搜索子片段: [{current_start:.1f}-{mid_time:.1f}s] 和 [{mid_time:.1f}-{current_end:.1f}s]")
+                logger.info(f"🔄 [二分 {search_depth}] 中等相关性，继续二分搜索:")
+                logger.info(f"   ├─ 左半段: [{current_start:.1f}-{mid_time:.1f}s] (时长: {mid_time-current_start:.1f}s)")
+                logger.info(f"   └─ 右半段: [{mid_time:.1f}-{current_end:.1f}s] (时长: {current_end-mid_time:.1f}s)")
+            
+            else:
+                logger.info(f"❌ [二分 {search_depth}] 低相关性片段，停止搜索: [{current_start:.1f}-{current_end:.1f}s] (分数: {relevance:.3f})")
             
             # 避免API调用过于频繁
             time.sleep(0.5)
         
-        # 按相关性排序并返回最好的片段
-        segments.sort(key=lambda x: x[2], reverse=True)
-        return segments[:self.max_frames]
+        return segments
+
+    def binary_search_segments(self, video_path: str, question: str, 
+                             start_time: float = 0, end_time: float = None) -> List[Tuple[float, float, float]]:
+        """改进的二分法搜索：先粗筛选，再对选中的片段进行二分法"""
+        logger.info(f"🚀 开始改进的二分法搜索流程")
+        
+        # 第一步：初步粗筛选
+        top_segments = self.initial_coarse_screening(video_path, question)
+        
+        if not top_segments:
+            logger.warning("粗筛选未找到相关片段")
+            return []
+        
+        # 第二步：对选中的片段进行二分法细化搜索
+        all_refined_segments = []
+        
+        for i, (seg_start, seg_end, initial_score) in enumerate(top_segments):
+            logger.info(f"\n--- 二分法细化搜索 {i+1}/{len(top_segments)} ---")
+            logger.info(f"🎯 目标片段: [{seg_start:.1f}-{seg_end:.1f}s] (初始分数: {initial_score:.3f})")
+            
+            refined_segments = self.binary_search_on_segment(
+                video_path, question, seg_start, seg_end
+            )
+            
+            # 如果二分法没有找到更好的片段，使用原始片段
+            if not refined_segments and initial_score > 0.4:
+                refined_segments = [(seg_start, seg_end, initial_score)]
+                logger.info(f"🔄 二分法未找到更好片段，保留原始片段: [{seg_start:.1f}-{seg_end:.1f}s] (分数: {initial_score:.3f})")
+            
+            all_refined_segments.extend(refined_segments)
+            
+            logger.info(f"✓ 片段 {i+1} 细化完成，找到 {len(refined_segments)} 个精确片段")
+        
+        # 第三步：合并结果并排序
+        all_refined_segments.sort(key=lambda x: x[2], reverse=True)
+        
+        # 去重：如果有重叠的片段，选择分数更高的
+        final_segments = []
+        for seg in all_refined_segments:
+            if len(final_segments) >= self.max_frames:
+                break
+            
+            # 检查是否与已有片段重叠
+            overlap = False
+            for existing_seg in final_segments:
+                if (seg[0] < existing_seg[1] and seg[1] > existing_seg[0]):  # 有重叠
+                    overlap = True
+                    break
+            
+            if not overlap:
+                final_segments.append(seg)
+        
+        logger.info(f"🏁 改进的二分法搜索完成，最终选择 {len(final_segments)} 个片段")
+        
+        # 显示最终结果
+        if final_segments:
+            logger.info(f"📋 最终选择的片段 (按相关性排序):")
+            for i, (start, end, score) in enumerate(final_segments):
+                logger.info(f"   {i+1}. [{start:.1f}-{end:.1f}s] 分数: {score:.3f}")
+        
+        return final_segments
     
     def extract_key_frames(self, video_path: str, question: str, output_dir: str) -> List[Dict]:
         """提取关键帧并保存"""
@@ -308,7 +503,7 @@ class BinarySearchExtractor:
                 pil_image.save(frame_path, "JPEG", quality=95)
                 
                 # 获取帧描述
-                frame_desc = self.clip_analyzer.describe_frame(frame)
+                frame_desc = self.clip_analyzer.describe_frame(frame, self.deepseek_client)
                 
                 frame_info = {
                     "frame_id": i + 1,
