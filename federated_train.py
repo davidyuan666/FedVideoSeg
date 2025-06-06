@@ -312,12 +312,14 @@ def split_data_federated(data: List, num_clients: int, split_type: str = "iid"):
 def main():
     parser = argparse.ArgumentParser(description="FedVideoQA 隐私保护联邦学习训练")
     
-    # 基础参数（复用train_qwen.py的参数）
+        # 基础参数（复用train_qwen.py的参数）
     parser.add_argument("--model_name", type=str, 
                        default="Qwen/Qwen2.5-VL-3B-Instruct",
                        help="Qwen模型名称")
     parser.add_argument("--data_file", type=str, required=True,
                        help="训练数据文件路径")
+    parser.add_argument("--num_samples", type=int, default=100,
+                       help="合成数据样本数量")
     
     # 训练模式
     parser.add_argument("--training_mode", type=str, 
@@ -340,6 +342,11 @@ def main():
                        help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=32,
                        help="LoRA alpha")
+    parser.add_argument("--lora_targets", type=str, nargs="+", 
+                       default=["q_proj", "v_proj", "k_proj", "o_proj"],
+                       help="LoRA目标模块")
+    parser.add_argument("--lora_dropout", type=float, default=0.1,
+                       help="LoRA dropout")
     
     # 联邦学习参数
     parser.add_argument("--num_clients", type=int, default=3,
