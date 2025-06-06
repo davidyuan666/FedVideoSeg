@@ -1,302 +1,320 @@
 """
-Training Script for FedVideoQA
-binary search + Qwen2.5-VL fine-tuning + federated learning
-Supports both fine-tuning and alignment tuning
+简化版 FedVideoQA 训练脚本
+Qwen2.5-VL 二分类器微调 - 最小功能实现
 """
 
 import argparse
 import logging
 import json
 import torch
-import flwr as fl
-from pathlib import Path
-from typing import List, Tuple, Dict, Any
-from enum import Enum
-
-from src.core.binary_search import BinarySearchLocalizer
-from src.core.deepseek_client import DeepSeekClient
-from src.federated.fed_client import FedClient
-from src.federated.fed_server import FedServer
-from src.models.qwen_finetuner import QwenFineTuner, QwenAlignmentTuner
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from peft import LoraConfig, get_peft_model
+import numpy as np
+from PIL import Image
+from typing import List, Tuple, Dict
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class TrainingMode(Enum):
-    """Training modes supported"""
-    FINETUNE = "finetune"
-    ALIGNMENT = "alignment"
-    BOTH = "both"
+class VideoQADataset(Dataset):
+    """简单的视频问答数据集"""
+    
+    def __init__(self, data: List[Tuple], processor, max_length=512):
+        self.data = data
+        self.processor = processor
+        self.max_length = max_length
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        frame, question, label = self.data[idx]
+        
+        # 处理输入
+        inputs = self.processor(
+            text=question,
+            images=frame,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_length
+        )
+        
+        # 移除batch维度
+        for key in inputs:
+            if isinstance(inputs[key], torch.Tensor):
+                inputs[key] = inputs[key].squeeze(0)
+        
+        inputs['labels'] = torch.tensor(label, dtype=torch.long)
+        return inputs
 
-class FedVideoQATrainer:
-    """Main trainer class for FedVideoQA with Qwen model support"""
+class QwenBinaryClassifier(nn.Module):
+    """基于Qwen的二分类器"""
+    
+    def __init__(self, model_name: str, num_classes: int = 2):
+        super().__init__()
+        self.backbone = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            cache_dir='./cache'
+        )
+        
+        # 添加分类头
+        hidden_size = self.backbone.config.hidden_size
+        self.classifier = nn.Linear(hidden_size, num_classes)
+        self.dropout = nn.Dropout(0.1)
+    
+    def forward(self, **inputs):
+        labels = inputs.pop('labels', None)
+        
+        # 获取特征
+        outputs = self.backbone(**inputs, output_hidden_states=True)
+        hidden_states = outputs.hidden_states[-1]
+        
+        # 池化得到句子表示
+        pooled_output = hidden_states.mean(dim=1)
+        pooled_output = self.dropout(pooled_output)
+        
+        # 分类
+        logits = self.classifier(pooled_output)
+        
+        loss = None
+        if labels is not None:
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(logits, labels)
+        
+        return {"loss": loss, "logits": logits}
+
+class SimpleTrainer:
+    """简化的训练器"""
     
     def __init__(self, args):
         self.args = args
-        self.training_mode = TrainingMode(args.training_mode)
-        self.model_name = args.model_name
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Initialize components
-        self.deepseek_client = DeepSeekClient()
-        self.localizer = BinarySearchLocalizer(self.deepseek_client)
+        # 初始化处理器
+        self.processor = AutoProcessor.from_pretrained(args.model_name,cache_dir='./cache')
         
-        # Initialize tuners based on mode
-        if self.training_mode in [TrainingMode.FINETUNE, TrainingMode.BOTH]:
-            self.finetuner = QwenFineTuner(
-                model_name=self.model_name,
-                lora_config={
-                    "r": args.lora_r,
-                    "lora_alpha": args.lora_alpha,
-                    "target_modules": args.lora_targets,
-                    "lora_dropout": args.lora_dropout
-                }
+        # 初始化模型
+        self.model = QwenBinaryClassifier(args.model_name)
+        
+        # 应用LoRA
+        if args.use_lora:
+            lora_config = LoraConfig(
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                target_modules=args.lora_targets,
+                lora_dropout=args.lora_dropout,
+                bias="none",
+                task_type="FEATURE_EXTRACTION"
             )
+            self.model = get_peft_model(self.model, lora_config)
         
-        if self.training_mode in [TrainingMode.ALIGNMENT, TrainingMode.BOTH]:
-            self.alignment_tuner = QwenAlignmentTuner(
-                model_name=self.model_name,
-                preference_config={
-                    "dpo_beta": args.dpo_beta,
-                    "max_length": args.max_length,
-                    "label_smoothing": args.label_smoothing
-                }
+        self.model.to(self.device)
+    
+    def generate_synthetic_data(self) -> List[Tuple]:
+        """生成合成数据用于测试"""
+        logger.info("生成合成数据...")
+        
+        questions = [
+            "这个画面中有人在说话吗？",
+            "画面中显示了文字或字幕吗？", 
+            "画面中有运动或动作吗？",
+            "这个画面包含主要内容吗？",
+            "这个画面与问题相关吗？",
+            "画面显示了重要的视觉信息吗？",
+            "画面中有清晰的对象或主体吗？",
+            "这个画面包含相关的上下文吗？"
+        ]
+        
+        data = []
+        for i in range(self.args.num_samples):
+            # 创建随机RGB图像（模拟视频帧）
+            frame = Image.fromarray(
+                np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
             )
-
-    def generate_training_data(self, video_paths: List[str], questions: List[str]) -> Tuple[List[Tuple], List[Tuple]]:
-        """Generate training data using binary search for both fine-tuning and alignment"""
-        
-        all_finetune_data = []
-        all_alignment_data = []
-        
-        for video_path, question in zip(video_paths, questions):
-            logger.info(f"Processing video: {video_path}")
             
-            # Generate frame-question pairs with relevance labels for fine-tuning
-            if self.training_mode in [TrainingMode.FINETUNE, TrainingMode.BOTH]:
-                finetune_data = self.localizer.generate_training_data(video_path, question)
-                all_finetune_data.extend(finetune_data)
-                logger.info(f"Generated {len(finetune_data)} fine-tuning samples")
+            question = questions[i % len(questions)]
+            label = np.random.randint(0, 2)  # 随机二分类标签
             
-            # Generate preference pairs for alignment tuning
-            if self.training_mode in [TrainingMode.ALIGNMENT, TrainingMode.BOTH]:
-                alignment_data = self.localizer.generate_preference_data(video_path, question)
-                all_alignment_data.extend(alignment_data)
-                logger.info(f"Generated {len(alignment_data)} alignment samples")
+            data.append((frame, question, label))
         
-        return all_finetune_data, all_alignment_data
-
-    def create_client_fn(self, client_data: Dict[str, Dict]):
-        """Create client function for federated learning"""
+        logger.info(f"生成了 {len(data)} 个合成样本")
+        return data
+    
+    def load_data_from_file(self, data_file: str) -> List[Tuple]:
+        """从文件加载数据"""
+        logger.info(f"从 {data_file} 加载数据...")
         
-        def client_fn(cid: str):
-            # Get client-specific data
-            local_data = client_data.get(cid, {})
-            device_type = "mobile" if "mobile" in cid else "desktop"
-            
-            return FedClient(
-                cid=cid, 
-                local_data=local_data,
-                device_type=device_type,
-                training_mode=self.training_mode,
-                model_name=self.model_name,
-                tuner_configs={
-                    "lora": {
-                        "r": self.args.lora_r,
-                        "lora_alpha": self.args.lora_alpha,
-                        "target_modules": self.args.lora_targets,
-                        "lora_dropout": self.args.lora_dropout
-                    },
-                    "alignment": {
-                        "dpo_beta": self.args.dpo_beta,
-                        "max_length": self.args.max_length,
-                        "label_smoothing": self.args.label_smoothing
-                    }
-                }
-            )
+        with open(data_file, 'r', encoding='utf-8') as f:
+            data_json = json.load(f)
         
-        return client_fn
-
-    def distribute_data(self, finetune_data: List[Tuple], alignment_data: List[Tuple]) -> Dict[str, Dict]:
-        """Distribute data to federated clients"""
-        
-        client_data = {}
-        
-        # Distribute fine-tuning data
-        if finetune_data:
-            samples_per_client = len(finetune_data) // self.args.num_clients
-            for i in range(self.args.num_clients):
-                client_id = f"client_{i}"
-                start_idx = i * samples_per_client
-                end_idx = start_idx + samples_per_client
+        data = []
+        for item in data_json.get('finetune', []):
+            try:
+                frame_path = item['frame_path']
+                question = item['question']
+                label = item['label']
                 
-                if client_id not in client_data:
-                    client_data[client_id] = {}
-                client_data[client_id]["finetune"] = finetune_data[start_idx:end_idx]
+                # 加载图像
+                if os.path.exists(frame_path):
+                    frame = Image.open(frame_path).convert('RGB')
+                    data.append((frame, question, label))
+                else:
+                    logger.warning(f"图像文件不存在: {frame_path}")
+            except Exception as e:
+                logger.error(f"加载数据项失败: {e}")
         
-        # Distribute alignment data
-        if alignment_data:
-            samples_per_client = len(alignment_data) // self.args.num_clients
-            for i in range(self.args.num_clients):
-                client_id = f"client_{i}"
-                start_idx = i * samples_per_client
-                end_idx = start_idx + samples_per_client
-                
-                if client_id not in client_data:
-                    client_data[client_id] = {}
-                client_data[client_id]["alignment"] = alignment_data[start_idx:end_idx]
+        logger.info(f"加载了 {len(data)} 个样本")
+        return data
+    
+    def train(self):
+        """训练模型"""
+        logger.info("开始训练...")
         
-        # Log distribution info
-        for client_id, data in client_data.items():
-            finetune_count = len(data.get("finetune", []))
-            alignment_count = len(data.get("alignment", []))
-            logger.info(f"Client {client_id}: {finetune_count} finetune, {alignment_count} alignment samples")
+        # 准备数据
+        if self.args.data_file and os.path.exists(self.args.data_file):
+            data = self.load_data_from_file(self.args.data_file)
+        else:
+            data = self.generate_synthetic_data()
         
-        return client_data
-
-    def run_federated_training(self):
-        """Run the complete federated training pipeline"""
-        
-        # 1. Generate training data using binary search
-        logger.info("Step 1: Generating training data with binary search...")
-        
-        # Example data (replace with your actual video paths and questions)
-        video_paths = [f"{self.args.data_dir}/video_{i}.mp4" for i in range(self.args.num_videos)]
-        questions = [f"What is discussed in this video segment {i}?" for i in range(self.args.num_videos)]
-        
-        finetune_data, alignment_data = self.generate_training_data(video_paths, questions)
-        
-        logger.info(f"Total fine-tuning samples: {len(finetune_data)}")
-        logger.info(f"Total alignment samples: {len(alignment_data)}")
-        
-        # 2. Distribute data to clients
-        logger.info("Step 2: Distributing data to federated clients...")
-        client_data = self.distribute_data(finetune_data, alignment_data)
-        
-        # 3. Start federated learning
-        logger.info("Step 3: Starting federated learning...")
-        
-        strategy = FedServer(
-            fraction_fit=self.args.fraction_fit,
-            fraction_evaluate=self.args.fraction_evaluate,
-            min_fit_clients=self.args.min_fit_clients,
-            min_evaluate_clients=self.args.min_evaluate_clients,
-            training_mode=self.training_mode
+        # 创建数据集和加载器
+        dataset = VideoQADataset(data, self.processor)
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=self.args.batch_size, 
+            shuffle=True,
+            collate_fn=self.collate_fn
         )
         
-        # Start simulation
-        history = fl.simulation.start_simulation(
-            client_fn=self.create_client_fn(client_data),
-            num_clients=self.args.num_clients,
-            config=fl.server.ServerConfig(num_rounds=self.args.num_rounds),
-            strategy=strategy,
-            client_resources={
-                "num_cpus": self.args.client_cpus, 
-                "num_gpus": self.args.client_gpus
-            }
+        # 优化器
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(), 
+            lr=self.args.learning_rate
         )
         
-        logger.info("Training completed!")
+        # 训练循环
+        self.model.train()
+        total_loss = 0
         
-        # 4. Save results
-        self.save_results(history, strategy)
-
-    def save_results(self, history, strategy):
-        """Save training results and model checkpoints"""
+        for epoch in range(self.args.num_epochs):
+            epoch_loss = 0
+            for batch_idx, batch in enumerate(dataloader):
+                # 移动到设备
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                        for k, v in batch.items()}
+                
+                optimizer.zero_grad()
+                
+                # 前向传播
+                outputs = self.model(**batch)
+                loss = outputs['loss']
+                
+                # 反向传播
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                
+                if batch_idx % 10 == 0:
+                    logger.info(f"Epoch {epoch+1}/{self.args.num_epochs}, "
+                              f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+            
+            avg_epoch_loss = epoch_loss / len(dataloader)
+            logger.info(f"Epoch {epoch+1} 完成, 平均损失: {avg_epoch_loss:.4f}")
         
-        logger.info("Step 4: Saving results...")
+        # 保存模型
+        self.save_model()
+    
+    def collate_fn(self, batch):
+        """批处理函数"""
+        batch_dict = {}
+        for key in batch[0].keys():
+            if key == 'labels':
+                batch_dict[key] = torch.stack([item[key] for item in batch])
+            else:
+                # 对于其他输入，尝试堆叠
+                try:
+                    batch_dict[key] = torch.stack([item[key] for item in batch])
+                except:
+                    batch_dict[key] = [item[key] for item in batch]
+        return batch_dict
+    
+    def save_model(self):
+        """保存模型"""
+        save_path = f"qwen_binary_classifier_epoch_{self.args.num_epochs}.pth"
         
-        results = {
-            "training_config": {
-                "training_mode": self.training_mode.value,
-                "model_name": self.model_name,
-                "num_rounds": self.args.num_rounds,
-                "num_clients": self.args.num_clients,
-                "lora_config": {
-                    "r": self.args.lora_r,
-                    "lora_alpha": self.args.lora_alpha,
-                    "target_modules": self.args.lora_targets,
-                    "lora_dropout": self.args.lora_dropout
-                }
-            },
-            "training_history": {
-                "losses": dict(history.losses_distributed),
-                "metrics": dict(history.metrics_distributed)
-            },
-            "round_metrics": getattr(strategy, 'round_metrics', {})
+        if hasattr(self.model, 'save_pretrained'):
+            # 如果是PEFT模型
+            self.model.save_pretrained("./saved_model")
+            logger.info("LoRA模型已保存到 ./saved_model")
+        else:
+            # 保存整个模型
+            torch.save(self.model.state_dict(), save_path)
+            logger.info(f"模型已保存到 {save_path}")
+        
+        # 保存训练配置
+        config = {
+            "model_name": self.args.model_name,
+            "num_epochs": self.args.num_epochs,
+            "batch_size": self.args.batch_size,
+            "learning_rate": self.args.learning_rate,
+            "use_lora": self.args.use_lora,
+            "lora_config": {
+                "r": self.args.lora_r,
+                "lora_alpha": self.args.lora_alpha,
+                "target_modules": self.args.lora_targets,
+                "lora_dropout": self.args.lora_dropout
+            } if self.args.use_lora else None
         }
         
-        # Save training results
-        results_path = f"training_results_{self.training_mode.value}.json"
-        with open(results_path, "w") as f:
-            json.dump(results, f, indent=2, default=str)
+        with open("training_config.json", "w", encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
         
-        logger.info(f"Results saved to {results_path}")
-        
-        # Save model checkpoints if available
-        if hasattr(strategy, 'get_global_model'):
-            model_path = f"global_model_{self.training_mode.value}.pth"
-            torch.save(strategy.get_global_model(), model_path)
-            logger.info(f"Global model saved to {model_path}")
+        logger.info("训练配置已保存到 training_config.json")
 
 def main():
-    parser = argparse.ArgumentParser(description="FedVideoQA Training with Qwen Fine-tuning")
+    parser = argparse.ArgumentParser(description="简化版 Qwen 二分类器训练")
     
-    # Basic training arguments
-    parser.add_argument("--training_mode", type=str, default="finetune", 
-                       choices=["finetune", "alignment", "both"],
-                       help="Training mode: finetune, alignment, or both")
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct",
-                       help="Qwen model name")
-    parser.add_argument("--num_rounds", type=int, default=50,
-                       help="Number of federated learning rounds")
-    parser.add_argument("--num_clients", type=int, default=5,
-                       help="Number of federated clients")
-    parser.add_argument("--data_dir", type=str, default="data/",
-                       help="Data directory")
-    parser.add_argument("--num_videos", type=int, default=10,
-                       help="Number of videos to process")
+    # 基础参数
+    parser.add_argument("--model_name", type=str, 
+                       default="Qwen/Qwen2.5-VL-7B-Instruct",
+                       help="Qwen模型名称")
+    parser.add_argument("--data_file", type=str, default=None,
+                       help="训练数据文件路径")
+    parser.add_argument("--num_samples", type=int, default=100,
+                       help="合成数据样本数量")
     
-    # Federated learning arguments
-    parser.add_argument("--fraction_fit", type=float, default=0.8,
-                       help="Fraction of clients for training")
-    parser.add_argument("--fraction_evaluate", type=float, default=0.5,
-                       help="Fraction of clients for evaluation")
-    parser.add_argument("--min_fit_clients", type=int, default=3,
-                       help="Minimum clients for training")
-    parser.add_argument("--min_evaluate_clients", type=int, default=3,
-                       help="Minimum clients for evaluation")
+    # 训练参数
+    parser.add_argument("--num_epochs", type=int, default=3,
+                       help="训练轮数")
+    parser.add_argument("--batch_size", type=int, default=2,
+                       help="批大小")
+    parser.add_argument("--learning_rate", type=float, default=2e-5,
+                       help="学习率")
     
-    # Resource allocation
-    parser.add_argument("--client_cpus", type=int, default=1,
-                       help="CPU cores per client")
-    parser.add_argument("--client_gpus", type=float, default=0.5,
-                       help="GPU allocation per client")
-    
-    # LoRA fine-tuning arguments
+    # LoRA参数
+    parser.add_argument("--use_lora", action="store_true",
+                       help="是否使用LoRA微调")
     parser.add_argument("--lora_r", type=int, default=16,
                        help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=32,
                        help="LoRA alpha")
     parser.add_argument("--lora_targets", type=str, nargs="+", 
                        default=["q_proj", "v_proj", "k_proj", "o_proj"],
-                       help="LoRA target modules")
+                       help="LoRA目标模块")
     parser.add_argument("--lora_dropout", type=float, default=0.1,
                        help="LoRA dropout")
     
-    # Alignment tuning arguments
-    parser.add_argument("--dpo_beta", type=float, default=0.1,
-                       help="DPO beta parameter")
-    parser.add_argument("--max_length", type=int, default=512,
-                       help="Maximum sequence length")
-    parser.add_argument("--label_smoothing", type=float, default=0.0,
-                       help="Label smoothing for alignment")
-    
     args = parser.parse_args()
     
-    # Initialize and run trainer
-    trainer = FedVideoQATrainer(args)
-    trainer.run_federated_training()
+    # 初始化训练器并开始训练
+    trainer = SimpleTrainer(args)
+    trainer.train()
 
 if __name__ == "__main__":
     main()
