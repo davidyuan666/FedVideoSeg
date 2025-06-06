@@ -136,6 +136,7 @@ class PrivateFederatedClient:
         
         for epoch in range(epochs):
             for batch in dataloader:
+                # 确保batch中的tensor都转移到正确的设备
                 batch = {k: v.to(server_device) if isinstance(v, torch.Tensor) else v 
                         for k, v in batch.items()}
                 
@@ -155,6 +156,11 @@ class PrivateFederatedClient:
                     # 移除不被模型接受的参数
                     labels = batch.pop('labels', None)
                     target_token_id = batch.pop('target_token_id', None)
+                    
+                    # 调试信息：检查batch中是否包含必要的参数
+                    logger.debug(f"Batch keys: {batch.keys()}")
+                    if 'image_grid_thw' in batch:
+                        logger.debug(f"image_grid_thw: {batch['image_grid_thw']}")
                     
                     # 标准的语言模型损失计算
                     outputs = server_model(**batch, labels=labels)
@@ -228,20 +234,22 @@ class PrivateFederatedClient:
                         padded_sequences = []
                         
                         for seq in sequences:
-                            if key == 'labels':
-                                # labels用-100填充
-                                pad_value = -100
-                            else:
-                                # 其他用tokenizer的pad_token_id填充
-                                pad_value = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-                            
                             pad_length = max_length - len(seq)
                             if pad_length > 0:
-                                if key == 'attention_mask':
-                                    # attention_mask用0填充
-                                    padded_seq = torch.cat([seq, torch.zeros(pad_length, dtype=seq.dtype)])
+                                if key == 'input_ids':
+                                    # 使用tokenizer的pad_token_id进行padding
+                                    pad_token_id = tokenizer.pad_token_id
+                                    if pad_token_id is None:
+                                        pad_token_id = tokenizer.eos_token_id
+                                    padded_seq = torch.nn.functional.pad(seq, (0, pad_length), value=pad_token_id)
+                                elif key == 'attention_mask':
+                                    # attention_mask用0进行padding
+                                    padded_seq = torch.nn.functional.pad(seq, (0, pad_length), value=0)
+                                elif key == 'labels':
+                                    # labels用-100进行padding（忽略损失）
+                                    padded_seq = torch.nn.functional.pad(seq, (0, pad_length), value=-100)
                                 else:
-                                    padded_seq = torch.cat([seq, torch.full((pad_length,), pad_value, dtype=seq.dtype)])
+                                    padded_seq = seq
                             else:
                                 padded_seq = seq
                             padded_sequences.append(padded_seq)
@@ -253,7 +261,55 @@ class PrivateFederatedClient:
             
             # 处理图像数据
             if 'pixel_values' in batch[0]:
-                batch_dict['pixel_values'] = torch.stack([item['pixel_values'] for item in batch])
+                pixel_values_list = [item['pixel_values'] for item in batch]
+                
+                # 检查所有pixel_values的形状是否一致
+                shapes = [pv.shape for pv in pixel_values_list]
+                if len(set(shapes)) == 1:
+                    # 形状一致，可以直接堆叠
+                    batch_dict['pixel_values'] = torch.stack(pixel_values_list)
+                else:
+                    # 形状不一致，使用第一个样本并调整其他数据
+                    logger.warning(f"Pixel values have inconsistent shapes: {shapes}")
+                    logger.warning("Using first sample only")
+                    batch_dict['pixel_values'] = pixel_values_list[0].unsqueeze(0)
+                    # 相应地只保留第一个样本的其他数据
+                    for key in batch_dict:
+                        if key != 'pixel_values' and isinstance(batch_dict[key], torch.Tensor):
+                            if batch_dict[key].dim() > 0:
+                                batch_dict[key] = batch_dict[key][:1]
+            
+            # 处理image_grid_thw - 关键修复
+            if 'image_grid_thw' in batch[0]:
+                image_grid_thw_list = [item['image_grid_thw'] for item in batch]
+                # 过滤掉None值
+                valid_grid_thw = [item for item in image_grid_thw_list if item is not None]
+                
+                if valid_grid_thw:
+                    try:
+                        batch_dict['image_grid_thw'] = torch.stack(valid_grid_thw)
+                    except Exception as e:
+                        logger.warning(f"Cannot stack image_grid_thw: {e}, using list format")
+                        batch_dict['image_grid_thw'] = valid_grid_thw
+                else:
+                    logger.warning("All image_grid_thw are None, skipping this parameter")
+            
+            # 处理其他tensor类型的数据
+            for key in batch[0].keys():
+                if key not in batch_dict:
+                    values = [item[key] for item in batch]
+                    
+                    # 检查是否都是tensor
+                    if all(isinstance(v, torch.Tensor) for v in values):
+                        try:
+                            batch_dict[key] = torch.stack(values)
+                        except Exception as e:
+                            # 如果无法堆叠，保持为列表
+                            logger.debug(f"Cannot stack {key}: {e}, keeping as list")
+                            batch_dict[key] = values
+                    else:
+                        # 非tensor数据保持为列表
+                        batch_dict[key] = values
             
             return batch_dict
         
