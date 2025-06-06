@@ -454,116 +454,28 @@ class UnifiedTrainer:
         # 处理其他tensor类型的数据
         for key in batch[0].keys():
             if key not in batch_dict:
-                try:
-                    values = [item[key] for item in batch]
-                    # 检查是否都是tensor并且形状兼容
-                    if all(isinstance(v, torch.Tensor) for v in values):
-                        # 对于图像相关的tensor，应该形状一致
+                values = [item[key] for item in batch]
+                
+                # 检查是否都是tensor
+                if all(isinstance(v, torch.Tensor) for v in values):
+                    try:
+                        # 对于图像相关的tensor，应该形状一致，直接堆叠
                         if key.startswith('pixel_values') or key == 'image_patches':
                             batch_dict[key] = torch.stack(values)
                         else:
                             # 其他tensor类型，尝试堆叠
                             batch_dict[key] = torch.stack(values)
-                    else:
-                        # 非tensor数据保持为列表
-                        batch_dict[key] = values
-                except Exception as e:
-                    # 如果堆叠失败，保持为列表
-                    batch_dict[key] = [item[key] for item in batch]
+                    except Exception as e:
+                        # 如果是关键的图像数据堆叠失败，抛出错误
+                        if key.startswith('pixel_values') or key == 'image_patches':
+                            logger.error(f"Failed to stack {key}: {e}")
+                            logger.error(f"Tensor shapes: {[v.shape for v in values]}")
+                            raise RuntimeError(f"Critical tensor {key} cannot be stacked")
+                        else:
+                            # 其他数据保持为列表
+                            batch_dict[key] = values
+                else:
+                    # 非tensor数据保持为列表
+                    batch_dict[key] = values
         
         return batch_dict
-    
-    def save_model(self):
-        """保存模型"""
-        mode_suffix = f"_{self.args.training_mode}"
-        save_path = f"qwen_classifier{mode_suffix}_epoch_{self.args.num_epochs}.pth"
-        
-        if hasattr(self.model, 'save_pretrained'):
-            # 如果是PEFT模型
-            save_dir = f"./saved_model{mode_suffix}"
-            self.model.save_pretrained(save_dir)
-            logger.info(f"LoRA模型已保存到 {save_dir}")
-        else:
-            # 保存整个模型
-            torch.save(self.model.state_dict(), save_path)
-            logger.info(f"模型已保存到 {save_path}")
-        
-        # 保存训练配置
-        config = {
-            "model_name": self.args.model_name,
-            "training_mode": self.args.training_mode,
-            "num_epochs": self.args.num_epochs,
-            "batch_size": self.args.batch_size,
-            "learning_rate": self.args.learning_rate,
-            "use_lora": self.args.use_lora,
-            "freeze_backbone": getattr(self.args, 'freeze_backbone', True),
-            "lora_config": {
-                "r": self.args.lora_r,
-                "lora_alpha": self.args.lora_alpha,
-                "target_modules": self.args.lora_targets,
-                "lora_dropout": self.args.lora_dropout
-            } if self.args.use_lora else None
-        }
-        
-        config_path = f"training_config{mode_suffix}.json"
-        with open(config_path, "w", encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-        
-        logger.info(f"训练配置已保存到 {config_path}")
-
-def main():
-    parser = argparse.ArgumentParser(description="统一的 Qwen 视频问答相关性判断训练")
-    
-    # 基础参数
-    parser.add_argument("--model_name", type=str, 
-                       default="Qwen/Qwen2.5-VL-3B-Instruct",
-                       help="Qwen模型名称")
-    parser.add_argument("--data_file", type=str, default=None,
-                       help="训练数据文件路径")
-    parser.add_argument("--num_samples", type=int, default=100,
-                       help="合成数据样本数量")
-    
-    # 训练模式选择
-    parser.add_argument("--training_mode", type=str, 
-                       choices=["encoder", "instruction"], 
-                       default="encoder",
-                       help="训练模式：encoder(编码器+分类头) 或 instruction(指令微调)")
-    parser.add_argument("--freeze_backbone", action="store_true",
-                       help="在编码器模式下是否冻结backbone(仅在encoder模式有效)")
-    
-    # 训练参数
-    parser.add_argument("--num_epochs", type=int, default=3,
-                       help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=2,
-                       help="批大小")
-    parser.add_argument("--learning_rate", type=float, default=2e-5,
-                       help="学习率")
-    
-    # LoRA参数
-    parser.add_argument("--use_lora", action="store_true",
-                       help="是否使用LoRA微调")
-    parser.add_argument("--lora_r", type=int, default=16,
-                       help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=32,
-                       help="LoRA alpha")
-    parser.add_argument("--lora_targets", type=str, nargs="+", 
-                       default=["q_proj", "v_proj", "k_proj", "o_proj"],
-                       help="LoRA目标模块")
-    parser.add_argument("--lora_dropout", type=float, default=0.1,
-                       help="LoRA dropout")
-    
-    args = parser.parse_args()
-    
-    # 打印训练配置
-    logger.info(f"训练模式: {args.training_mode}")
-    logger.info(f"模型: {args.model_name}")
-    logger.info(f"使用LoRA: {args.use_lora}")
-    if args.training_mode == "encoder":
-        logger.info(f"冻结backbone: {args.freeze_backbone}")
-    
-    # 初始化训练器并开始训练
-    trainer = UnifiedTrainer(args)
-    trainer.train()
-
-if __name__ == "__main__":
-    main()
