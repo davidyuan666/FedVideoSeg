@@ -11,4 +11,4 @@ CUDA_VISIBLE_DEVICES=0 python train_qwen.py --training_mode encoder --use_lora -
 # 使用真实数据训练（指定GPU 0）
 CUDA_VISIBLE_DEVICES=0 python train_qwen.py --training_mode instruction --use_lora --data_file data/va_pair_balanced_train.json
 
-CUDA_VISIBLE_DEVICES=0 python train_qwen.py --training_mode encoder --num_samples 2 --batch_size 1
+CUDA_VISIBLE_DEVICES=0 python train_qwen.py --training_mode encoder --num_samples 2 --batch_size 1 --data_file data/va_pair_balanced_train.json

@@ -483,6 +483,13 @@ class UnifiedTrainer:
             if key in batch[0]:
                 sequences = [item[key] for item in batch]
                 
+                # 检查第一个元素是否为标量（0维张量）
+                first_seq = sequences[0]
+                if first_seq.dim() == 0:
+                    # 标量张量，直接堆叠（encoder模式的labels）
+                    batch_dict[key] = torch.stack(sequences)
+                    continue
+                
                 # 检查是否需要padding（序列长度不同）
                 seq_lengths = [len(seq) for seq in sequences]
                 if len(set(seq_lengths)) > 1:  # 长度不同，需要padding
