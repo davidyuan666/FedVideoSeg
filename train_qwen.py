@@ -51,9 +51,12 @@ class VideoQADataset(Dataset):
     
     def _get_encoder_item(self, frame, question, label):
         """编码器模式的数据处理"""
+        # 为Qwen2.5-VL添加图像标记
+        text_with_image = f"<image>{question}"
+        
         # 处理输入
         inputs = self.processor(
-            text=question,
+            text=text_with_image,
             images=frame,
             return_tensors="pt",
             padding=True,
@@ -71,8 +74,8 @@ class VideoQADataset(Dataset):
     
     def _get_instruction_item(self, frame, question, label):
         """指令微调模式的数据处理"""
-        # 构建指令
-        instruction = self.instruction_template.format(question=question)
+        # 构建指令，为Qwen2.5-VL添加图像标记
+        instruction = f"<image>" + self.instruction_template.format(question=question)
         target = "是" if label == 1 else "否"
         
         # 处理输入
@@ -423,33 +426,41 @@ class UnifiedTrainer:
         # 分离不同类型的数据
         batch_dict = {}
         
-        # 处理标签和target_token_id - 这些可以直接堆叠
-        for key in ['labels', 'target_token_id']:
-            if key in batch[0]:
-                batch_dict[key] = torch.stack([item[key] for item in batch])
+        # 首先处理 target_token_id（固定大小，可以直接堆叠）
+        if 'target_token_id' in batch[0]:
+            batch_dict['target_token_id'] = torch.stack([item['target_token_id'] for item in batch])
         
-        # 对于需要padding的序列数据，使用tokenizer的pad功能
-        sequence_keys = ['input_ids', 'attention_mask']
+        # 对于需要padding的序列数据，包括labels（在instruction模式下）
+        sequence_keys = ['input_ids', 'attention_mask', 'labels']
         for key in sequence_keys:
             if key in batch[0]:
                 sequences = [item[key] for item in batch]
-                # 手动pad序列到相同长度
-                max_len = max(len(seq) for seq in sequences)
-                padded_sequences = []
                 
-                for seq in sequences:
-                    if key == 'input_ids':
-                        # 使用tokenizer的pad_token_id进行padding
-                        pad_token_id = self.tokenizer.pad_token_id
-                        if pad_token_id is None:
-                            pad_token_id = self.tokenizer.eos_token_id
-                        padded = torch.nn.functional.pad(seq, (0, max_len - len(seq)), value=pad_token_id)
-                    else:  # attention_mask
-                        # attention_mask用0进行padding
-                        padded = torch.nn.functional.pad(seq, (0, max_len - len(seq)), value=0)
-                    padded_sequences.append(padded)
-                
-                batch_dict[key] = torch.stack(padded_sequences)
+                # 检查是否需要padding（序列长度不同）
+                seq_lengths = [len(seq) for seq in sequences]
+                if len(set(seq_lengths)) > 1:  # 长度不同，需要padding
+                    max_len = max(seq_lengths)
+                    padded_sequences = []
+                    
+                    for seq in sequences:
+                        if key == 'input_ids':
+                            # 使用tokenizer的pad_token_id进行padding
+                            pad_token_id = self.tokenizer.pad_token_id
+                            if pad_token_id is None:
+                                pad_token_id = self.tokenizer.eos_token_id
+                            padded = torch.nn.functional.pad(seq, (0, max_len - len(seq)), value=pad_token_id)
+                        elif key == 'attention_mask':
+                            # attention_mask用0进行padding
+                            padded = torch.nn.functional.pad(seq, (0, max_len - len(seq)), value=0)
+                        elif key == 'labels':
+                            # labels用-100进行padding（忽略损失）
+                            padded = torch.nn.functional.pad(seq, (0, max_len - len(seq)), value=-100)
+                        padded_sequences.append(padded)
+                    
+                    batch_dict[key] = torch.stack(padded_sequences)
+                else:
+                    # 长度相同，直接堆叠
+                    batch_dict[key] = torch.stack(sequences)
         
         # 处理其他tensor类型的数据
         for key in batch[0].keys():
