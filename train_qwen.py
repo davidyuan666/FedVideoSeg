@@ -11,7 +11,7 @@ import json
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, AutoTokenizer
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, AutoTokenizer
 from peft import LoraConfig, get_peft_model
 import numpy as np
 from PIL import Image
@@ -108,7 +108,7 @@ class QwenEncoderClassifier(nn.Module):
     
     def __init__(self, model_name: str, num_classes: int = 2, freeze_backbone: bool = True):
         super().__init__()
-        self.backbone = Qwen2VLForConditionalGeneration.from_pretrained(
+        self.backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=torch.float16,
             device_map="auto",
@@ -165,7 +165,7 @@ class QwenInstructionClassifier(nn.Module):
     
     def __init__(self, model_name: str):
         super().__init__()
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=torch.float16,
             device_map="auto",
