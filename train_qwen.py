@@ -181,6 +181,10 @@ class QwenEncoderClassifier(nn.Module):
         
         # 注意力池化层
         self.attention_pool = nn.Linear(hidden_size, 1)
+        
+        # 确保自定义层与backbone使用相同的dtype
+        self.feature_projection = self.feature_projection.to(torch.float16)
+        self.attention_pool = self.attention_pool.to(torch.float16)
     
     def forward(self, **inputs):
         labels = inputs.pop('labels', None)
@@ -206,7 +210,8 @@ class QwenEncoderClassifier(nn.Module):
         loss = None
         if labels is not None:
             loss_fn = nn.CrossEntropyLoss()
-            loss = loss_fn(logits, labels)
+            # 确保labels和logits的dtype兼容
+            loss = loss_fn(logits.float(), labels)
         
         return {"loss": loss, "logits": logits}
 
