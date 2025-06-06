@@ -1,0 +1,116 @@
+[
+  {
+    "image_path": "output\\3058613626\\3058613626_frame_2_7.5s.jpg",
+    "question": "视频中有吉他的部分?",
+    "answer": "否",
+    "label": 0,
+    "video_id": "2950216986",
+    "frame_filename": "3058613626_frame_2_7.5s.jpg",
+    "source_video_id": "3058613626",
+    "sample_type": "negative"
+  },
+  {
+    "image_path": "output\\3418738633\\3418738633_frame_2_7.5s.jpg",
+    "question": "视频中有吉他的部分?",
+    "answer": "否",
+    "label": 0,
+    "video_id": "2950216986",
+    "frame_filename": "3418738633_frame_2_7.5s.jpg",
+    "source_video_id": "3418738633",
+    "sample_type": "negative"
+  },
+  {
+    "image_path": "output\\3515562099\\3515562099_frame_1_1.2s.jpg",
+    "question": "有马桶的地方",
+    "answer": "是",
+    "label": 1,
+    "video_id": "3515562099",
+    "frame_filename": "3515562099_frame_1_1.2s.jpg",
+    "sample_type": "positive"
+  },
+  {
+    "image_path": "output\\3058613626\\3058613626_frame_1_2.5s.jpg",
+    "question": "视频中有吉他的部分",
+    "answer": "是",
+    "label": 1,
+    "video_id": "3058613626",
+    "frame_filename": "3058613626_frame_1_2.5s.jpg",
+    "sample_type": "positive"
+  },
+  {
+    "image_path": "output\\3058613626\\3058613626_frame_2_7.5s.jpg",
+    "question": "视频中有吉他的部分",
+    "answer": "是",
+    "label": 1,
+    "video_id": "3058613626",
+    "frame_filename": "3058613626_frame_2_7.5s.jpg",
+    "sample_type": "positive"
+  },
+  {
+    "image_path": "output\\2950216986\\2950216986_frame_2_52.5s.jpg",
+    "question": "视频中有吉他的部分",
+    "answer": "否",
+    "label": 0,
+    "video_id": "3058613626",
+    "frame_filename": "2950216986_frame_2_52.5s.jpg",
+    "source_video_id": "2950216986",
+    "sample_type": "negative"
+  },
+  {
+    "image_path": "output\\3058613626\\3058613626_frame_1_2.5s.jpg",
+    "question": "有马桶的地方",
+    "answer": "否",
+    "label": 0,
+    "video_id": "3515562099",
+    "frame_filename": "3058613626_frame_1_2.5s.jpg",
+    "source_video_id": "3058613626",
+    "sample_type": "negative"
+  },
+  {
+    "image_path": "output\\2950216986\\2950216986_frame_2_52.5s.jpg",
+    "question": "视频中有吉他的部分?",
+    "answer": "是",
+    "label": 1,
+    "video_id": "2950216986",
+    "frame_filename": "2950216986_frame_2_52.5s.jpg",
+    "sample_type": "positive"
+  },
+  {
+    "image_path": "output\\2950216986\\2950216986_frame_2_52.5s.jpg",
+    "question": "视频中何时有女人",
+    "answer": "否",
+    "label": 0,
+    "video_id": "3418738633",
+    "frame_filename": "2950216986_frame_2_52.5s.jpg",
+    "source_video_id": "2950216986",
+    "sample_type": "negative"
+  },
+  {
+    "image_path": "output\\3515562099\\3515562099_frame_2_3.8s.jpg",
+    "question": "有马桶的地方",
+    "answer": "是",
+    "label": 1,
+    "video_id": "3515562099",
+    "frame_filename": "3515562099_frame_2_3.8s.jpg",
+    "sample_type": "positive"
+  },
+  {
+    "image_path": "output\\3418738633\\3418738633_frame_2_7.5s.jpg",
+    "question": "视频中何时有女人",
+    "answer": "是",
+    "label": 1,
+    "video_id": "3418738633",
+    "frame_filename": "3418738633_frame_2_7.5s.jpg",
+    "sample_type": "positive"
+  },
+  {
+    "image_path": "output\\3058613626\\3058613626_frame_2_7.5s.jpg",
+    "question": "有马桶的地方",
+    "answer": "否",
+    "label": 0,
+    "video_id": "3515562099",
+    "frame_filename": "3058613626_frame_2_7.5s.jpg",
+    "source_video_id": "3058613626",
+    "sample_type": "negative"
+  }
+]

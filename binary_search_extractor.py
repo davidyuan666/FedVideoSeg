@@ -226,15 +226,20 @@ class BinarySearchExtractor:
         self.clip_analyzer = CLIPFrameAnalyzer()
         self.deepseek_client = DeepSeekClient(deepseek_api_key)
         self.min_segment_duration = 2.0  # 最小片段时长(秒)
-        self.max_frames = 5  # 最大提取帧数
+        self.max_frames = 3  # 每个问题最大提取帧数
         self.initial_segment_duration = 5.0  # 初步筛选的片段时长(秒)
-        self.top_segments_for_binary_search = 3  # 选择前N个片段进行二分法搜索
-        
-        # 预定义问题
-        self.predefined_questions = [
-            "when does the man boil milk",
-            "when does the man make cake"
-        ]
+        self.top_segments_for_binary_search = 2  # 选择前N个片段进行二分法搜索
+    
+    def load_questions(self, questions_file: str) -> List[Dict]:
+        """加载问题文件"""
+        try:
+            with open(questions_file, 'r', encoding='utf-8') as f:
+                questions = json.load(f)
+            logger.info(f"成功加载 {len(questions)} 个问题")
+            return questions
+        except Exception as e:
+            logger.error(f"加载问题文件失败: {e}")
+            return []
     
     def extract_frame_at_time(self, video_path: str, timestamp: float) -> np.ndarray:
         """在指定时间提取视频帧"""
@@ -279,7 +284,7 @@ class BinarySearchExtractor:
             start_frame = self.extract_frame_at_time(video_path, start_time)
             end_frame = self.extract_frame_at_time(video_path, end_time)
             
-            # 获取帧描述（传入deepseek_client以支持更好的描述）
+            # 获取帧描述
             start_desc = self.clip_analyzer.describe_frame(start_frame, self.deepseek_client)
             end_desc = self.clip_analyzer.describe_frame(end_frame, self.deepseek_client)
             
@@ -407,8 +412,7 @@ class BinarySearchExtractor:
         
         return segments
 
-    def binary_search_segments(self, video_path: str, question: str, 
-                             start_time: float = 0, end_time: float = None) -> List[Tuple[float, float, float]]:
+    def binary_search_segments(self, video_path: str, question: str) -> List[Tuple[float, float, float]]:
         """改进的二分法搜索：先粗筛选，再对选中的片段进行二分法"""
         logger.info(f"🚀 开始改进的二分法搜索流程")
         
@@ -468,13 +472,15 @@ class BinarySearchExtractor:
         
         return final_segments
     
-    def extract_key_frames(self, video_path: str, question: str, output_dir: str) -> List[Dict]:
-        """提取关键帧并保存"""
-        logger.info(f"开始处理视频: {video_path}")
-        logger.info(f"问题: {question}")
+    def extract_key_frames_for_question(self, video_path: str, video_id: str, 
+                                       question: str, output_dir: str) -> List[Dict]:
+        """为特定问题提取关键帧"""
+        logger.info(f"🎬 处理视频: {video_id}")
+        logger.info(f"❓ 问题: {question}")
         
-        # 创建输出目录
-        os.makedirs(output_dir, exist_ok=True)
+        # 创建视频输出目录
+        video_output_dir = os.path.join(output_dir, video_id)
+        os.makedirs(video_output_dir, exist_ok=True)
         
         # 搜索相关片段
         relevant_segments = self.binary_search_segments(video_path, question)
@@ -494,9 +500,9 @@ class BinarySearchExtractor:
                 # 提取帧
                 frame = self.extract_frame_at_time(video_path, key_timestamp)
                 
-                # 保存帧
-                frame_filename = f"frame_{i+1}_{key_timestamp:.1f}s.jpg"
-                frame_path = os.path.join(output_dir, frame_filename)
+                # 生成帧文件名
+                frame_filename = f"{video_id}_frame_{i+1}_{key_timestamp:.1f}s.jpg"
+                frame_path = os.path.join(video_output_dir, frame_filename)
                 
                 # 转换为PIL图像并保存
                 pil_image = Image.fromarray(frame)
@@ -506,145 +512,147 @@ class BinarySearchExtractor:
                 frame_desc = self.clip_analyzer.describe_frame(frame, self.deepseek_client)
                 
                 frame_info = {
-                    "frame_id": i + 1,
+                    "video_id": video_id,
+                    "frame_filename": frame_filename,
                     "timestamp": key_timestamp,
                     "segment_start": start_time,
                     "segment_end": end_time,
                     "relevance_score": relevance,
                     "description": frame_desc,
-                    "filename": frame_filename,
                     "file_path": frame_path
                 }
                 
                 extracted_frames.append(frame_info)
                 
-                logger.info(f"✓ 提取关键帧 {i+1}: {key_timestamp:.1f}s (相关性: {relevance:.3f})")
+                logger.info(f"✅ 提取关键帧 {i+1}: {frame_filename} (时间: {key_timestamp:.1f}s, 相关性: {relevance:.3f})")
                 
             except Exception as e:
-                logger.error(f"提取帧失败: {e}")
+                logger.error(f"❌ 提取帧失败: {e}")
                 continue
         
         return extracted_frames
     
-    def process_video_with_questions(self, video_path: str, output_base_dir: str) -> Dict:
-        """使用所有预定义问题处理视频"""
-        video_name = Path(video_path).stem
-        video_output_dir = os.path.join(output_base_dir, video_name)
+    def process_all_videos_with_questions(self, video_dir: str, questions_file: str, output_dir: str):
+        """处理所有视频和对应的问题"""
+        logger.info("=" * 80)
+        logger.info("🚀 开始批量处理视频和问题")
         
-        logger.info(f"=" * 60)
-        logger.info(f"处理视频: {video_name}")
-        logger.info(f"输出目录: {video_output_dir}")
+        # 加载问题
+        questions = self.load_questions(questions_file)
+        if not questions:
+            logger.error("❌ 无法加载问题文件")
+            return
         
-        results = {
-            "video_name": video_name,
-            "video_path": video_path,
-            "output_directory": video_output_dir,
-            "questions_results": []
-        }
+        # 创建输出目录
+        os.makedirs(output_dir, exist_ok=True)
         
-        for i, question in enumerate(self.predefined_questions):
-            logger.info(f"\n--- 问题 {i+1}/{len(self.predefined_questions)} ---")
-            
-            # 为每个问题创建子目录
-            question_dir = os.path.join(video_output_dir, f"question_{i+1}")
-            
-            # 提取关键帧
-            extracted_frames = self.extract_key_frames(video_path, question, question_dir)
-            
-            question_result = {
-                "question_id": i + 1,
-                "question": question,
-                "output_directory": question_dir,
-                "extracted_frames": extracted_frames,
-                "frame_count": len(extracted_frames)
-            }
-            
-            results["questions_results"].append(question_result)
-            
-            logger.info(f"问题 {i+1} 完成，提取了 {len(extracted_frames)} 个关键帧")
+        # 准备结果数据
+        vq_pairs = []
         
-        # 保存结果到JSON文件
-        results_file = os.path.join(video_output_dir, "extraction_results.json")
-        with open(results_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+        # 处理每个问题
+        for question_data in questions:
+            video_id = question_data["video_id"]
+            question = question_data["question"]
+            
+            # 构建视频文件路径
+            video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv']
+            video_path = None
+            
+            for ext in video_extensions:
+                candidate_path = os.path.join(video_dir, f"{video_id}{ext}")
+                if os.path.exists(candidate_path):
+                    video_path = candidate_path
+                    break
+            
+            if not video_path:
+                logger.warning(f"⚠️  视频文件未找到: {video_id}")
+                continue
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"🎯 处理视频ID: {video_id}")
+            logger.info(f"📁 视频路径: {video_path}")
+            logger.info(f"❓ 问题: {question}")
+            
+            try:
+                # 提取关键帧
+                extracted_frames = self.extract_key_frames_for_question(
+                    video_path, video_id, question, output_dir
+                )
+                
+                # 添加到结果中
+                if extracted_frames:
+                    vq_pair = {
+                        "video_id": video_id,
+                        "question": question,
+                        "frames": [frame["frame_filename"] for frame in extracted_frames]
+                    }
+                    vq_pairs.append(vq_pair)
+                    
+                    logger.info(f"✅ 视频 {video_id} 处理完成，提取了 {len(extracted_frames)} 个关键帧")
+                else:
+                    logger.warning(f"⚠️  视频 {video_id} 未提取到关键帧")
+                
+                # 避免处理过于频繁
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"❌ 处理视频 {video_id} 失败: {e}")
+                continue
         
-        logger.info(f"结果已保存到: {results_file}")
-        return results
+        # 保存vq_pair.json结果
+        vq_pair_file = os.path.join(output_dir, "vq_pair.json")
+        with open(vq_pair_file, 'w', encoding='utf-8') as f:
+            json.dump(vq_pairs, f, indent=2, ensure_ascii=False)
+        
+        logger.info("=" * 80)
+        logger.info("🎉 批量处理完成!")
+        logger.info(f"📊 处理统计:")
+        logger.info(f"   - 总问题数: {len(questions)}")
+        logger.info(f"   - 成功处理: {len(vq_pairs)}")
+        logger.info(f"   - 总提取帧数: {sum(len(pair['frames']) for pair in vq_pairs)}")
+        logger.info(f"📁 结果文件: {vq_pair_file}")
+        
+        return vq_pairs
 
 def main():
     """主函数"""
-    logger.info("=== 二分法视频关键帧提取器 ===")
+    logger.info("=== 基于问题的视频关键帧提取器 ===")
     
     # 配置路径
     video_dir = "dataset/video"
-    output_dir = "extracted_frames"
+    questions_file = "dataset/questions.json"
+    output_dir = "output"
     
-    # 检查视频目录
+    # 检查必要文件和目录
     if not os.path.exists(video_dir):
-        logger.error(f"视频目录不存在: {video_dir}")
-        logger.info("请创建目录并放入视频文件:")
-        logger.info(f"mkdir -p {video_dir}")
+        logger.error(f"❌ 视频目录不存在: {video_dir}")
+        return
+    
+    if not os.path.exists(questions_file):
+        logger.error(f"❌ 问题文件不存在: {questions_file}")
         return
     
     # 获取DeepSeek API密钥
     deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
     if not deepseek_api_key:
-        logger.warning("未设置DEEPSEEK_API_KEY环境变量，将使用模拟响应")
+        logger.warning("⚠️  未设置DEEPSEEK_API_KEY环境变量，将使用模拟响应")
     
     # 初始化提取器
     extractor = BinarySearchExtractor(deepseek_api_key)
     
-    # 查找视频文件
-    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv']
-    video_files = []
-    
-    for ext in video_extensions:
-        video_files.extend(Path(video_dir).glob(f"*{ext}"))
-        video_files.extend(Path(video_dir).glob(f"*{ext.upper()}"))
-    
-    if not video_files:
-        logger.error(f"在 {video_dir} 中未找到视频文件")
-        logger.info(f"支持的格式: {', '.join(video_extensions)}")
-        return
-    
-    logger.info(f"找到 {len(video_files)} 个视频文件")
-    
-    # 处理每个视频
-    all_results = []
-    
-    for video_file in video_files:
-        try:
-            result = extractor.process_video_with_questions(str(video_file), output_dir)
-            all_results.append(result)
+    # 处理所有视频和问题
+    try:
+        vq_pairs = extractor.process_all_videos_with_questions(
+            video_dir, questions_file, output_dir
+        )
+        
+        if vq_pairs:
+            logger.info("🎉 处理成功完成!")
+        else:
+            logger.warning("⚠️  未成功处理任何视频")
             
-        except Exception as e:
-            logger.error(f"处理视频 {video_file} 失败: {e}")
-            continue
-    
-    # 保存总体结果
-    summary_file = os.path.join(output_dir, "extraction_summary.json")
-    summary = {
-        "total_videos": len(video_files),
-        "processed_videos": len(all_results),
-        "predefined_questions": extractor.predefined_questions,
-        "results": all_results
-    }
-    
-    with open(summary_file, 'w', encoding='utf-8') as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
-    
-    logger.info("=" * 60)
-    logger.info("处理完成!")
-    logger.info(f"总视频数: {len(video_files)}")
-    logger.info(f"成功处理: {len(all_results)}")
-    logger.info(f"结果摘要: {summary_file}")
-    
-    # 打印提取统计
-    total_frames = sum(
-        sum(q["frame_count"] for q in result["questions_results"]) 
-        for result in all_results
-    )
-    logger.info(f"总提取帧数: {total_frames}")
+    except Exception as e:
+        logger.error(f"❌ 处理过程中发生错误: {e}")
 
 if __name__ == "__main__":
     main() 

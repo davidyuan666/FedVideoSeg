@@ -268,27 +268,46 @@ class UnifiedTrainer:
         return data
     
     def load_data_from_file(self, data_file: str) -> List[Tuple]:
-        """从文件加载数据"""
+        """从文件加载数据 - 适配va_pair格式"""
         logger.info(f"从 {data_file} 加载数据...")
         
         with open(data_file, 'r', encoding='utf-8') as f:
             data_json = json.load(f)
         
         data = []
-        for item in data_json.get('finetune', []):
-            try:
-                frame_path = item['frame_path']
-                question = item['question']
-                label = item['label']
-                
-                # 加载图像
-                if os.path.exists(frame_path):
-                    frame = Image.open(frame_path).convert('RGB')
-                    data.append((frame, question, label))
-                else:
-                    logger.warning(f"图像文件不存在: {frame_path}")
-            except Exception as e:
-                logger.error(f"加载数据项失败: {e}")
+        # 如果是列表格式（va_pair格式）
+        if isinstance(data_json, list):
+            for item in data_json:
+                try:
+                    frame_path = item['image_path']
+                    question = item['question']
+                    label = item['label']
+                    
+                    # 加载图像
+                    if os.path.exists(frame_path):
+                        frame = Image.open(frame_path).convert('RGB')
+                        data.append((frame, question, label))
+                    else:
+                        logger.warning(f"图像文件不存在: {frame_path}")
+                except Exception as e:
+                    logger.error(f"加载数据项失败: {e}")
+        
+        # 如果是字典格式（原来的格式）
+        elif isinstance(data_json, dict):
+            for item in data_json.get('finetune', []):
+                try:
+                    frame_path = item['frame_path']
+                    question = item['question']
+                    label = item['label']
+                    
+                    # 加载图像
+                    if os.path.exists(frame_path):
+                        frame = Image.open(frame_path).convert('RGB')
+                        data.append((frame, question, label))
+                    else:
+                        logger.warning(f"图像文件不存在: {frame_path}")
+                except Exception as e:
+                    logger.error(f"加载数据项失败: {e}")
         
         logger.info(f"加载了 {len(data)} 个样本")
         return data
