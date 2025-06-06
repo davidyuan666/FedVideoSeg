@@ -112,16 +112,14 @@ class PrivateFederatedClient:
         )
         
         from torch.utils.data import DataLoader
-        # 创建临时的trainer实例来使用collate_fn
-        temp_trainer = type('TempTrainer', (), {
-            'collate_fn': self._create_collate_fn(server_processor, server_tokenizer)
-        })()
+        # 直接使用collate_fn，不包装在临时对象中
+        collate_fn = self._create_collate_fn(server_processor, server_tokenizer)
         
         dataloader = DataLoader(
             dataset, 
             batch_size=self.args.batch_size, 
             shuffle=True,
-            collate_fn=temp_trainer.collate_fn
+            collate_fn=collate_fn
         )
         
         # 本地优化器
