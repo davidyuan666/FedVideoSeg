@@ -280,6 +280,8 @@ class UnifiedTrainer:
             for item in data_json:
                 try:
                     frame_path = item['image_path']
+                    # 修复路径分隔符问题
+                    frame_path = frame_path.replace('\\', os.sep)
                     question = item['question']
                     label = item['label']
                     
@@ -297,6 +299,8 @@ class UnifiedTrainer:
             for item in data_json.get('finetune', []):
                 try:
                     frame_path = item['frame_path']
+                    # 修复路径分隔符问题
+                    frame_path = frame_path.replace('\\', os.sep)
                     question = item['question']
                     label = item['label']
                     

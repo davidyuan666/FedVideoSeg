@@ -35,3 +35,4 @@ differential-privacy==0.1.0
 pyyaml>=6.0.2
 python-dotenv>=1.0.1
 loguru>=0.7.2 
+peft
