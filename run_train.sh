@@ -8,16 +8,7 @@
 
 
 # 使用合成数据训练（指定GPU 0）
-python train_qwen.py \
-    --data_file output/va_pair_balanced_train.json \
-    --training_mode encoder \
-    --freeze_backbone \
-    --use_lora \
-    --num_epochs 5 \
-    --batch_size 4 \
-    --learning_rate 2e-5 \
-    --lora_r 16 \
-    --lora_alpha 32
+python train_qwen.py --data_file output/va_pair_balanced_train.json --training_mode encoder --freeze_backbone --use_lora --num_epochs 5 --batch_size 4 --learning_rate 2e-5 --lora_r 16 --lora_alpha 32
 
 # 使用真实数据训练（指定GPU 0）
 # CUDA_VISIBLE_DEVICES=0 python train_qwen.py \
