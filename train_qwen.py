@@ -1,6 +1,8 @@
 """
-简化版 FedVideoQA 训练脚本
-Qwen2.5-VL 二分类器微调 - 最小功能实现
+改进版 FedVideoQA 训练脚本
+支持两种训练方式：
+1. 编码器模式：将Qwen2.5-VL作为特征提取器 + 分类头
+2. 指令微调模式：使用指令模板进行端到端微调
 """
 
 import argparse
@@ -9,7 +11,7 @@ import json
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, AutoTokenizer
 from peft import LoraConfig, get_peft_model
 import numpy as np
 from PIL import Image
@@ -20,12 +22,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class VideoQADataset(Dataset):
-    """简单的视频问答数据集"""
+    """支持两种模式的视频问答数据集"""
     
-    def __init__(self, data: List[Tuple], processor, max_length=512):
+    def __init__(self, data: List[Tuple], processor, tokenizer, max_length=512, training_mode="encoder"):
         self.data = data
         self.processor = processor
+        self.tokenizer = tokenizer
         self.max_length = max_length
+        self.training_mode = training_mode
+        
+        # 指令微调模式的提示模板
+        self.instruction_template = "请根据图像内容回答问题：{question}\n这个问题与图像是否相关？请只回答'是'或'否'。"
+        
+        # 获取是/否的token id
+        self.yes_token_id = self.tokenizer.encode("是", add_special_tokens=False)[0]
+        self.no_token_id = self.tokenizer.encode("否", add_special_tokens=False)[0]
     
     def __len__(self):
         return len(self.data)
@@ -33,6 +44,13 @@ class VideoQADataset(Dataset):
     def __getitem__(self, idx):
         frame, question, label = self.data[idx]
         
+        if self.training_mode == "encoder":
+            return self._get_encoder_item(frame, question, label)
+        else:  # instruction mode
+            return self._get_instruction_item(frame, question, label)
+    
+    def _get_encoder_item(self, frame, question, label):
+        """编码器模式的数据处理"""
         # 处理输入
         inputs = self.processor(
             text=question,
@@ -50,11 +68,45 @@ class VideoQADataset(Dataset):
         
         inputs['labels'] = torch.tensor(label, dtype=torch.long)
         return inputs
-
-class QwenBinaryClassifier(nn.Module):
-    """基于Qwen的二分类器"""
     
-    def __init__(self, model_name: str, num_classes: int = 2):
+    def _get_instruction_item(self, frame, question, label):
+        """指令微调模式的数据处理"""
+        # 构建指令
+        instruction = self.instruction_template.format(question=question)
+        target = "是" if label == 1 else "否"
+        
+        # 处理输入
+        inputs = self.processor(
+            text=instruction,
+            images=frame,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_length
+        )
+        
+        # 处理目标输出
+        target_token_id = self.yes_token_id if label == 1 else self.no_token_id
+        
+        # 移除batch维度
+        for key in inputs:
+            if isinstance(inputs[key], torch.Tensor):
+                inputs[key] = inputs[key].squeeze(0)
+        
+        # 为指令微调准备标签
+        input_ids = inputs['input_ids']
+        labels = input_ids.clone()
+        labels[:-1] = -100  # 忽略输入部分的损失
+        labels[-1] = target_token_id  # 只计算最后一个token的损失
+        
+        inputs['labels'] = labels
+        inputs['target_token_id'] = torch.tensor(target_token_id, dtype=torch.long)
+        return inputs
+
+class QwenEncoderClassifier(nn.Module):
+    """改进的基于Qwen的编码器 + 分类器"""
+    
+    def __init__(self, model_name: str, num_classes: int = 2, freeze_backbone: bool = True):
         super().__init__()
         self.backbone = Qwen2VLForConditionalGeneration.from_pretrained(
             model_name,
@@ -63,24 +115,43 @@ class QwenBinaryClassifier(nn.Module):
             cache_dir='./cache'
         )
         
-        # 添加分类头
+        # 是否冻结backbone
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+        
+        # 改进的特征提取和分类头
         hidden_size = self.backbone.config.hidden_size
-        self.classifier = nn.Linear(hidden_size, num_classes)
-        self.dropout = nn.Dropout(0.1)
+        self.feature_projection = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size // 2, num_classes)
+        )
+        
+        # 注意力池化层
+        self.attention_pool = nn.Linear(hidden_size, 1)
     
     def forward(self, **inputs):
         labels = inputs.pop('labels', None)
         
         # 获取特征
-        outputs = self.backbone(**inputs, output_hidden_states=True)
+        if hasattr(self.backbone, 'parameters') and not next(self.backbone.parameters()).requires_grad:
+            with torch.no_grad():
+                outputs = self.backbone(**inputs, output_hidden_states=True)
+        else:
+            outputs = self.backbone(**inputs, output_hidden_states=True)
+        
         hidden_states = outputs.hidden_states[-1]
         
-        # 池化得到句子表示
-        pooled_output = hidden_states.mean(dim=1)
-        pooled_output = self.dropout(pooled_output)
+        # 注意力池化
+        attention_weights = torch.softmax(
+            self.attention_pool(hidden_states).squeeze(-1), dim=-1
+        ).unsqueeze(-1)
+        pooled_output = torch.sum(hidden_states * attention_weights, dim=1)
         
         # 分类
-        logits = self.classifier(pooled_output)
+        logits = self.feature_projection(pooled_output)
         
         loss = None
         if labels is not None:
@@ -89,18 +160,62 @@ class QwenBinaryClassifier(nn.Module):
         
         return {"loss": loss, "logits": logits}
 
-class SimpleTrainer:
-    """简化的训练器"""
+class QwenInstructionClassifier(nn.Module):
+    """基于指令微调的分类器"""
+    
+    def __init__(self, model_name: str):
+        super().__init__()
+        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            cache_dir='./cache'
+        )
+    
+    def forward(self, **inputs):
+        labels = inputs.pop('labels', None)
+        target_token_id = inputs.pop('target_token_id', None)
+        
+        # 标准的语言模型损失计算
+        outputs = self.model(**inputs, labels=labels)
+        
+        return {
+            "loss": outputs.loss,
+            "logits": outputs.logits,
+            "target_token_id": target_token_id
+        }
+    
+    def generate_answer(self, **inputs):
+        """生成回答用于推理"""
+        with torch.no_grad():
+            generated = self.model.generate(
+                **inputs,
+                max_new_tokens=1,
+                do_sample=False,
+                pad_token_id=self.model.config.eos_token_id,
+                temperature=0.1
+            )
+        return generated
+
+class UnifiedTrainer:
+    """统一的训练器，支持两种训练模式"""
     
     def __init__(self, args):
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # 初始化处理器
-        self.processor = AutoProcessor.from_pretrained(args.model_name,cache_dir='./cache')
+        # 初始化处理器和分词器
+        self.processor = AutoProcessor.from_pretrained(args.model_name, cache_dir='./cache')
+        self.tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir='./cache')
         
-        # 初始化模型
-        self.model = QwenBinaryClassifier(args.model_name)
+        # 根据训练模式初始化不同的模型
+        if args.training_mode == "encoder":
+            self.model = QwenEncoderClassifier(
+                args.model_name, 
+                freeze_backbone=args.freeze_backbone
+            )
+        else:  # instruction mode
+            self.model = QwenInstructionClassifier(args.model_name)
         
         # 应用LoRA
         if args.use_lora:
@@ -110,25 +225,26 @@ class SimpleTrainer:
                 target_modules=args.lora_targets,
                 lora_dropout=args.lora_dropout,
                 bias="none",
-                task_type="FEATURE_EXTRACTION"
+                task_type="CAUSAL_LM" if args.training_mode == "instruction" else "FEATURE_EXTRACTION"
             )
             self.model = get_peft_model(self.model, lora_config)
         
         self.model.to(self.device)
     
     def generate_synthetic_data(self) -> List[Tuple]:
-        """生成合成数据用于测试"""
+        """生成合成数据用于测试，专注于问题与图像的相关性"""
         logger.info("生成合成数据...")
         
+        # 相关性问题 - 模拟视频问答中问题与帧的相关性判断
         questions = [
-            "这个画面中有人在说话吗？",
-            "画面中显示了文字或字幕吗？", 
-            "画面中有运动或动作吗？",
-            "这个画面包含主要内容吗？",
-            "这个画面与问题相关吗？",
-            "画面显示了重要的视觉信息吗？",
-            "画面中有清晰的对象或主体吗？",
-            "这个画面包含相关的上下文吗？"
+            "视频中出现了什么动物？",  # 可能相关
+            "这个场景发生在什么时间？",  # 可能相关
+            "画面中有几个人？",  # 可能相关
+            "视频的背景音乐是什么？",  # 不相关（纯视觉无法判断）
+            "这个品牌的历史是什么？",  # 不相关
+            "画面中的天气如何？",  # 可能相关
+            "视频的制作成本是多少？",  # 不相关
+            "画面中显示的文字内容是什么？",  # 可能相关
         ]
         
         data = []
@@ -139,7 +255,12 @@ class SimpleTrainer:
             )
             
             question = questions[i % len(questions)]
-            label = np.random.randint(0, 2)  # 随机二分类标签
+            
+            # 模拟相关性标签：前4个问题类型更可能相关，后4个不相关
+            if i % len(questions) < 4:
+                label = np.random.choice([0, 1], p=[0.3, 0.7])  # 70%概率相关
+            else:
+                label = np.random.choice([0, 1], p=[0.8, 0.2])  # 20%概率相关
             
             data.append((frame, question, label))
         
@@ -174,7 +295,7 @@ class SimpleTrainer:
     
     def train(self):
         """训练模型"""
-        logger.info("开始训练...")
+        logger.info(f"开始{self.args.training_mode}模式训练...")
         
         # 准备数据
         if self.args.data_file and os.path.exists(self.args.data_file):
@@ -183,7 +304,12 @@ class SimpleTrainer:
             data = self.generate_synthetic_data()
         
         # 创建数据集和加载器
-        dataset = VideoQADataset(data, self.processor)
+        dataset = VideoQADataset(
+            data, 
+            self.processor, 
+            self.tokenizer,
+            training_mode=self.args.training_mode
+        )
         dataloader = DataLoader(
             dataset, 
             batch_size=self.args.batch_size, 
@@ -199,10 +325,12 @@ class SimpleTrainer:
         
         # 训练循环
         self.model.train()
-        total_loss = 0
         
         for epoch in range(self.args.num_epochs):
             epoch_loss = 0
+            correct_predictions = 0
+            total_samples = 0
+            
             for batch_idx, batch in enumerate(dataloader):
                 # 移动到设备
                 batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
@@ -220,12 +348,24 @@ class SimpleTrainer:
                 
                 epoch_loss += loss.item()
                 
+                # 计算准确率
+                if self.args.training_mode == "encoder":
+                    predictions = torch.argmax(outputs['logits'], dim=-1)
+                    labels = batch['labels']
+                    correct_predictions += (predictions == labels).sum().item()
+                    total_samples += labels.size(0)
+                
                 if batch_idx % 10 == 0:
                     logger.info(f"Epoch {epoch+1}/{self.args.num_epochs}, "
                               f"Batch {batch_idx}, Loss: {loss.item():.4f}")
             
             avg_epoch_loss = epoch_loss / len(dataloader)
-            logger.info(f"Epoch {epoch+1} 完成, 平均损失: {avg_epoch_loss:.4f}")
+            if self.args.training_mode == "encoder" and total_samples > 0:
+                accuracy = correct_predictions / total_samples
+                logger.info(f"Epoch {epoch+1} 完成, 平均损失: {avg_epoch_loss:.4f}, "
+                          f"准确率: {accuracy:.4f}")
+            else:
+                logger.info(f"Epoch {epoch+1} 完成, 平均损失: {avg_epoch_loss:.4f}")
         
         # 保存模型
         self.save_model()
@@ -234,7 +374,7 @@ class SimpleTrainer:
         """批处理函数"""
         batch_dict = {}
         for key in batch[0].keys():
-            if key == 'labels':
+            if key in ['labels', 'target_token_id']:
                 batch_dict[key] = torch.stack([item[key] for item in batch])
             else:
                 # 对于其他输入，尝试堆叠
@@ -246,12 +386,14 @@ class SimpleTrainer:
     
     def save_model(self):
         """保存模型"""
-        save_path = f"qwen_binary_classifier_epoch_{self.args.num_epochs}.pth"
+        mode_suffix = f"_{self.args.training_mode}"
+        save_path = f"qwen_classifier{mode_suffix}_epoch_{self.args.num_epochs}.pth"
         
         if hasattr(self.model, 'save_pretrained'):
             # 如果是PEFT模型
-            self.model.save_pretrained("./saved_model")
-            logger.info("LoRA模型已保存到 ./saved_model")
+            save_dir = f"./saved_model{mode_suffix}"
+            self.model.save_pretrained(save_dir)
+            logger.info(f"LoRA模型已保存到 {save_dir}")
         else:
             # 保存整个模型
             torch.save(self.model.state_dict(), save_path)
@@ -260,10 +402,12 @@ class SimpleTrainer:
         # 保存训练配置
         config = {
             "model_name": self.args.model_name,
+            "training_mode": self.args.training_mode,
             "num_epochs": self.args.num_epochs,
             "batch_size": self.args.batch_size,
             "learning_rate": self.args.learning_rate,
             "use_lora": self.args.use_lora,
+            "freeze_backbone": getattr(self.args, 'freeze_backbone', True),
             "lora_config": {
                 "r": self.args.lora_r,
                 "lora_alpha": self.args.lora_alpha,
@@ -272,13 +416,14 @@ class SimpleTrainer:
             } if self.args.use_lora else None
         }
         
-        with open("training_config.json", "w", encoding='utf-8') as f:
+        config_path = f"training_config{mode_suffix}.json"
+        with open(config_path, "w", encoding='utf-8') as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
         
-        logger.info("训练配置已保存到 training_config.json")
+        logger.info(f"训练配置已保存到 {config_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="简化版 Qwen 二分类器训练")
+    parser = argparse.ArgumentParser(description="统一的 Qwen 视频问答相关性判断训练")
     
     # 基础参数
     parser.add_argument("--model_name", type=str, 
@@ -288,6 +433,14 @@ def main():
                        help="训练数据文件路径")
     parser.add_argument("--num_samples", type=int, default=100,
                        help="合成数据样本数量")
+    
+    # 训练模式选择
+    parser.add_argument("--training_mode", type=str, 
+                       choices=["encoder", "instruction"], 
+                       default="encoder",
+                       help="训练模式：encoder(编码器+分类头) 或 instruction(指令微调)")
+    parser.add_argument("--freeze_backbone", action="store_true",
+                       help="在编码器模式下是否冻结backbone(仅在encoder模式有效)")
     
     # 训练参数
     parser.add_argument("--num_epochs", type=int, default=3,
@@ -312,8 +465,15 @@ def main():
     
     args = parser.parse_args()
     
+    # 打印训练配置
+    logger.info(f"训练模式: {args.training_mode}")
+    logger.info(f"模型: {args.model_name}")
+    logger.info(f"使用LoRA: {args.use_lora}")
+    if args.training_mode == "encoder":
+        logger.info(f"冻结backbone: {args.freeze_backbone}")
+    
     # 初始化训练器并开始训练
-    trainer = SimpleTrainer(args)
+    trainer = UnifiedTrainer(args)
     trainer.train()
 
 if __name__ == "__main__":
