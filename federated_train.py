@@ -94,78 +94,58 @@ class PrivateFederatedClient:
         self.client_id = client_id
         self.args = args
         self.data = data_subset
-        # 不在初始化时创建trainer，避免重复加载模型
-        self.trainer = None
+        # 不保存trainer实例，避免内存问题
         self.privacy_engine = privacy_engine
         
         logger.info(f"隐私保护客户端 {client_id} 初始化完成，数据量: {len(data_subset)}")
     
-    def _get_trainer(self):
-        """延迟初始化trainer"""
-        if self.trainer is None:
-            # 修改args以避免device_map冲突
-            client_args = copy.deepcopy(self.args)
-            # 在federated learning中，我们手动管理设备分配
-            self.trainer = UnifiedTrainer(client_args)
-        return self.trainer
-    
-    def local_train(self, global_weights: Dict[str, torch.Tensor], epochs: int = 1):
-        """本地训练（含隐私保护）"""
+    def local_train(self, server_model, server_processor, server_tokenizer, server_device, epochs: int = 1):
+        """本地训练（含隐私保护）- 使用服务器提供的模型"""
         logger.info(f"客户端 {self.client_id} 开始隐私保护本地训练...")
-        
-        # 获取trainer实例
-        trainer = self._get_trainer()
-        
-        # 加载全局权重
-        try:
-            trainer.model.load_state_dict(global_weights, strict=False)
-        except Exception as e:
-            logger.warning(f"加载权重时出现警告: {e}")
-            # 尝试更宽松的加载
-            missing_keys, unexpected_keys = trainer.model.load_state_dict(global_weights, strict=False)
-            if missing_keys:
-                logger.info(f"缺失的键: {missing_keys}")
-            if unexpected_keys:
-                logger.info(f"意外的键: {unexpected_keys}")
         
         # 创建本地数据集
         dataset = VideoQADataset(
             self.data, 
-            trainer.processor, 
-            trainer.tokenizer,
+            server_processor, 
+            server_tokenizer,
             training_mode=self.args.training_mode
         )
         
         from torch.utils.data import DataLoader
+        # 创建临时的trainer实例来使用collate_fn
+        temp_trainer = type('TempTrainer', (), {
+            'collate_fn': self._create_collate_fn(server_processor, server_tokenizer)
+        })()
+        
         dataloader = DataLoader(
             dataset, 
             batch_size=self.args.batch_size, 
             shuffle=True,
-            collate_fn=trainer.collate_fn
+            collate_fn=temp_trainer.collate_fn
         )
         
         # 本地优化器
         optimizer = torch.optim.AdamW(
-            trainer.model.parameters(), 
+            server_model.parameters(), 
             lr=self.args.learning_rate
         )
         
         # 训练
-        trainer.model.train()
+        server_model.train()
         total_loss = 0
         correct_predictions = 0
         total_samples = 0
         
         for epoch in range(epochs):
             for batch in dataloader:
-                batch = {k: v.to(trainer.device) if isinstance(v, torch.Tensor) else v 
+                batch = {k: v.to(server_device) if isinstance(v, torch.Tensor) else v 
                         for k, v in batch.items()}
                 
                 optimizer.zero_grad()
                 
-                # 前向传播 - 根据训练模式选择不同的计算方式（复制train_qwen.py的逻辑）
+                # 前向传播 - 根据训练模式选择不同的计算方式
                 if self.args.training_mode == "encoder":
-                    outputs = trainer.model(**batch)
+                    outputs = server_model(**batch)
                     loss = outputs['loss']
                     
                     # 计算准确率
@@ -179,14 +159,14 @@ class PrivateFederatedClient:
                     target_token_id = batch.pop('target_token_id', None)
                     
                     # 标准的语言模型损失计算
-                    outputs = trainer.model(**batch, labels=labels)
+                    outputs = server_model(**batch, labels=labels)
                     loss = outputs.loss
                 
                 loss.backward()
                 
                 # 梯度裁剪（隐私保护）
                 if self.args.use_privacy:
-                    self.privacy_engine.clip_gradients(trainer.model)
+                    self.privacy_engine.clip_gradients(server_model)
                 
                 optimizer.step()
                 total_loss += loss.item()
@@ -201,7 +181,7 @@ class PrivateFederatedClient:
             logger.info(f"客户端 {self.client_id} 隐私保护本地训练完成，平均损失: {avg_loss:.4f}")
         
         # 获取训练后的权重
-        trained_weights = trainer.model.state_dict()
+        trained_weights = server_model.state_dict()
         
         # 应用隐私保护
         if self.args.use_privacy:
@@ -217,6 +197,69 @@ class PrivateFederatedClient:
                 )
         
         return trained_weights, len(self.data)
+    
+    def _create_collate_fn(self, processor, tokenizer):
+        """创建collate函数"""
+        def collate_fn(batch):
+            """改进的批处理函数，正确处理变长序列和图像数据"""
+            # 分离不同类型的数据
+            batch_dict = {}
+            
+            # 首先处理 target_token_id（固定大小，可以直接堆叠）
+            if 'target_token_id' in batch[0]:
+                batch_dict['target_token_id'] = torch.stack([item['target_token_id'] for item in batch])
+            
+            # 对于需要padding的序列数据，包括labels（在instruction模式下）
+            sequence_keys = ['input_ids', 'attention_mask', 'labels']
+            for key in sequence_keys:
+                if key in batch[0]:
+                    sequences = [item[key] for item in batch]
+                    
+                    # 检查第一个元素是否为标量（0维张量）
+                    first_seq = sequences[0]
+                    if first_seq.dim() == 0:
+                        # 标量张量，直接堆叠（encoder模式的labels）
+                        batch_dict[key] = torch.stack(sequences)
+                        continue
+                    
+                    # 检查是否需要padding（序列长度不同）
+                    seq_lengths = [len(seq) for seq in sequences]
+                    if len(set(seq_lengths)) > 1:
+                        # 需要padding
+                        max_length = max(seq_lengths)
+                        padded_sequences = []
+                        
+                        for seq in sequences:
+                            if key == 'labels':
+                                # labels用-100填充
+                                pad_value = -100
+                            else:
+                                # 其他用tokenizer的pad_token_id填充
+                                pad_value = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+                            
+                            pad_length = max_length - len(seq)
+                            if pad_length > 0:
+                                if key == 'attention_mask':
+                                    # attention_mask用0填充
+                                    padded_seq = torch.cat([seq, torch.zeros(pad_length, dtype=seq.dtype)])
+                                else:
+                                    padded_seq = torch.cat([seq, torch.full((pad_length,), pad_value, dtype=seq.dtype)])
+                            else:
+                                padded_seq = seq
+                            padded_sequences.append(padded_seq)
+                        
+                        batch_dict[key] = torch.stack(padded_sequences)
+                    else:
+                        # 长度相同，直接堆叠
+                        batch_dict[key] = torch.stack(sequences)
+            
+            # 处理图像数据
+            if 'pixel_values' in batch[0]:
+                batch_dict['pixel_values'] = torch.stack([item['pixel_values'] for item in batch])
+            
+            return batch_dict
+        
+        return collate_fn
 
 class PrivateFederatedServer:
     """支持隐私保护的联邦学习服务器"""
@@ -228,6 +271,9 @@ class PrivateFederatedServer:
             trainer = UnifiedTrainer(args)
             self.global_model = trainer.model
             self.device = trainer.device
+            self.processor = trainer.processor
+            self.tokenizer = trainer.tokenizer
+            logger.info("服务器全局模型初始化成功")
         except Exception as e:
             logger.error(f"初始化全局模型失败: {e}")
             # 降级方案：使用简单的模型初始化
@@ -286,17 +332,33 @@ class PrivateFederatedServer:
         """单轮联邦训练"""
         logger.info(f"开始第 {round_num} 轮隐私保护联邦训练...")
         
-        # 获取当前全局权重
-        global_weights = self.global_model.state_dict()
-        
         # 客户端本地训练
         client_weights = []
         client_sizes = []
         
-        for client in self.clients:
-            weights, size = client.local_train(global_weights, local_epochs)
+        for i, client in enumerate(self.clients):
+            logger.info(f"训练客户端 {i}")
+            
+            # 清理GPU缓存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # 为每个客户端恢复初始权重
+            current_weights = copy.deepcopy(self.global_model.state_dict())
+            self.global_model.load_state_dict(current_weights)
+            
+            # 客户端使用服务器的模型进行训练
+            weights, size = client.local_train(
+                self.global_model, 
+                self.processor, 
+                self.tokenizer, 
+                self.device, 
+                local_epochs
+            )
             client_weights.append(weights)
             client_sizes.append(size)
+            
+            logger.info(f"客户端 {i} 训练完成")
         
         # 安全联邦平均
         new_global_weights = self.secure_federated_averaging(client_weights, client_sizes)
@@ -374,7 +436,7 @@ def split_data_federated(data: List, num_clients: int, split_type: str = "iid"):
 def main():
     parser = argparse.ArgumentParser(description="FedVideoQA 隐私保护联邦学习训练")
     
-        # 基础参数（复用train_qwen.py的参数）
+    # 基础参数（复用train_qwen.py的参数）
     parser.add_argument("--model_name", type=str, 
                        default="Qwen/Qwen2.5-VL-3B-Instruct",
                        help="Qwen模型名称")
@@ -453,8 +515,14 @@ def main():
         logger.error(f"数据文件不存在: {args.data_file}")
         return
     
-    trainer = UnifiedTrainer(args)
-    data = trainer.load_data_from_file(args.data_file)
+    # 临时创建trainer只为加载数据
+    temp_trainer = UnifiedTrainer(args)
+    data = temp_trainer.load_data_from_file(args.data_file)
+    del temp_trainer  # 立即删除以释放内存
+    
+    # 清理GPU缓存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     # 分割数据给客户端
     client_data_splits = split_data_federated(data, args.num_clients, args.split_type)
@@ -465,10 +533,10 @@ def main():
         max_grad_norm=args.max_grad_norm
     ) if args.use_privacy else None
     
-    # 初始化服务器
+    # 初始化服务器（这里会创建全局模型）
     server = PrivateFederatedServer(args, privacy_engine)
     
-    # 创建客户端
+    # 创建客户端（不创建模型实例）
     for i in range(args.num_clients):
         client = PrivateFederatedClient(i, args, client_data_splits[i], privacy_engine)
         server.add_client(client)
@@ -476,6 +544,10 @@ def main():
     # 联邦学习训练
     for round_num in range(1, args.num_rounds + 1):
         server.train_round(round_num, args.local_epochs)
+        
+        # 清理GPU缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # 隐私审计
         if args.use_privacy:
