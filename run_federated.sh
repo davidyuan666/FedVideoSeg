@@ -27,7 +27,7 @@
 # echo "Stage 1 完成！"
 
 # Stage 2: Instruction模式隐私保护联邦学习
-echo "开始Stage 2: Instruction模式隐私保护联邦学习..."
+echo "开始Instruction模式隐私保护联邦学习..."
 python federated_train.py \
     --data_file output/va_pair_balanced_train.json \
     --training_mode instruction \
@@ -36,7 +36,7 @@ python federated_train.py \
     --learning_rate 1e-5 \
     --lora_r 8 \
     --lora_alpha 16 \
-    --num_clients 3 \
+    --num_clients 2 \
     --num_rounds 2 \
     --local_epochs 1 \
     --split_type iid \
