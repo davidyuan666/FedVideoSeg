@@ -282,7 +282,7 @@ def main():
     
     # 基础参数
     parser.add_argument("--model_name", type=str, 
-                       default="Qwen/Qwen2.5-VL-7B-Instruct",
+                       default="Qwen/Qwen2.5-VL-3B-Instruct",
                        help="Qwen模型名称")
     parser.add_argument("--data_file", type=str, default=None,
                        help="训练数据文件路径")
