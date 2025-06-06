@@ -503,7 +503,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="FedVideoQA Qwen训练脚本")
     
     # 基本参数
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct",
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct",
                        help="预训练模型名称")
     parser.add_argument("--training_mode", type=str, choices=["encoder", "instruction"], 
                        default="encoder", help="训练模式: encoder 或 instruction")
