@@ -479,3 +479,94 @@ class UnifiedTrainer:
                     batch_dict[key] = values
         
         return batch_dict
+    
+    def save_model(self):
+        """保存训练好的模型"""
+        save_dir = f"./saved_models/{self.args.training_mode}_model"
+        os.makedirs(save_dir, exist_ok=True)
+        
+        if hasattr(self.model, 'save_pretrained'):
+            # 如果是PEFT模型或标准transformers模型
+            self.model.save_pretrained(save_dir)
+            logger.info(f"模型已保存到 {save_dir}")
+        else:
+            # 如果是自定义模型，保存state_dict
+            torch.save(self.model.state_dict(), os.path.join(save_dir, "model.pth"))
+            logger.info(f"模型权重已保存到 {save_dir}/model.pth")
+        
+        # 同时保存processor和tokenizer
+        self.processor.save_pretrained(save_dir)
+        self.tokenizer.save_pretrained(save_dir)
+
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description="FedVideoQA Qwen训练脚本")
+    
+    # 基本参数
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct",
+                       help="预训练模型名称")
+    parser.add_argument("--training_mode", type=str, choices=["encoder", "instruction"], 
+                       default="encoder", help="训练模式: encoder 或 instruction")
+    parser.add_argument("--data_file", type=str, default=None,
+                       help="训练数据文件路径")
+    parser.add_argument("--num_samples", type=int, default=100,
+                       help="合成数据样本数量（当没有数据文件时使用）")
+    
+    # 训练参数
+    parser.add_argument("--batch_size", type=int, default=2,
+                       help="批处理大小")
+    parser.add_argument("--num_epochs", type=int, default=3,
+                       help="训练轮数")
+    parser.add_argument("--learning_rate", type=float, default=1e-4,
+                       help="学习率")
+    parser.add_argument("--max_length", type=int, default=512,
+                       help="最大序列长度")
+    
+    # 模型参数
+    parser.add_argument("--freeze_backbone", action="store_true",
+                       help="是否冻结backbone（仅encoder模式）")
+    
+    # LoRA参数
+    parser.add_argument("--use_lora", action="store_true",
+                       help="是否使用LoRA微调")
+    parser.add_argument("--lora_r", type=int, default=16,
+                       help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=32,
+                       help="LoRA alpha")
+    parser.add_argument("--lora_dropout", type=float, default=0.1,
+                       help="LoRA dropout")
+    parser.add_argument("--lora_targets", type=str, nargs="+", 
+                       default=["q_proj", "v_proj", "k_proj", "o_proj"],
+                       help="LoRA目标模块")
+    
+    return parser.parse_args()
+
+def main():
+    """主函数"""
+    args = parse_args()
+    
+    logger.info("="*50)
+    logger.info("FedVideoQA Qwen训练脚本启动")
+    logger.info(f"训练模式: {args.training_mode}")
+    logger.info(f"模型: {args.model_name}")
+    logger.info(f"数据文件: {args.data_file}")
+    logger.info(f"使用LoRA: {args.use_lora}")
+    logger.info("="*50)
+    
+    try:
+        # 创建训练器
+        trainer = UnifiedTrainer(args)
+        
+        # 开始训练
+        trainer.train()
+        
+        logger.info("训练完成！")
+        
+    except Exception as e:
+        logger.error(f"训练过程中出现错误: {e}")
+        raise
+
+if __name__ == "__main__":
+    main()
+    
+
