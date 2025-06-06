@@ -214,20 +214,38 @@ class UnifiedTrainer:
                 args.model_name, 
                 freeze_backbone=args.freeze_backbone
             )
+            # 应用LoRA到编码器模式
+            if args.use_lora:
+                lora_config = LoraConfig(
+                    r=args.lora_r,
+                    lora_alpha=args.lora_alpha,
+                    target_modules=args.lora_targets,
+                    lora_dropout=args.lora_dropout,
+                    bias="none",
+                    task_type="FEATURE_EXTRACTION"
+                )
+                self.model = get_peft_model(self.model, lora_config)
         else:  # instruction mode
-            self.model = QwenInstructionClassifier(args.model_name)
-        
-        # 应用LoRA
-        if args.use_lora:
-            lora_config = LoraConfig(
-                r=args.lora_r,
-                lora_alpha=args.lora_alpha,
-                target_modules=args.lora_targets,
-                lora_dropout=args.lora_dropout,
-                bias="none",
-                task_type="CAUSAL_LM" if args.training_mode == "instruction" else "FEATURE_EXTRACTION"
+            # 对于指令微调模式，直接使用原始模型并应用LoRA
+            base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                args.model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                cache_dir='./cache'
             )
-            self.model = get_peft_model(self.model, lora_config)
+            
+            if args.use_lora:
+                lora_config = LoraConfig(
+                    r=args.lora_r,
+                    lora_alpha=args.lora_alpha,
+                    target_modules=args.lora_targets,
+                    lora_dropout=args.lora_dropout,
+                    bias="none",
+                    task_type="CAUSAL_LM"
+                )
+                self.model = get_peft_model(base_model, lora_config)
+            else:
+                self.model = base_model
         
         self.model.to(self.device)
     
@@ -361,22 +379,29 @@ class UnifiedTrainer:
                 
                 optimizer.zero_grad()
                 
-                # 前向传播
-                outputs = self.model(**batch)
-                loss = outputs['loss']
+                # 前向传播 - 根据训练模式选择不同的计算方式
+                if self.args.training_mode == "encoder":
+                    outputs = self.model(**batch)
+                    loss = outputs['loss']
+                    
+                    # 计算准确率
+                    predictions = torch.argmax(outputs['logits'], dim=-1)
+                    labels = batch['labels']
+                    correct_predictions += (predictions == labels).sum().item()
+                    total_samples += labels.size(0)
+                else:  # instruction mode
+                    labels = batch.pop('labels', None)
+                    target_token_id = batch.pop('target_token_id', None)
+                    
+                    # 标准的语言模型损失计算
+                    outputs = self.model(**batch, labels=labels)
+                    loss = outputs.loss
                 
                 # 反向传播
                 loss.backward()
                 optimizer.step()
                 
                 epoch_loss += loss.item()
-                
-                # 计算准确率
-                if self.args.training_mode == "encoder":
-                    predictions = torch.argmax(outputs['logits'], dim=-1)
-                    labels = batch['labels']
-                    correct_predictions += (predictions == labels).sum().item()
-                    total_samples += labels.size(0)
                 
                 if batch_idx % 10 == 0:
                     logger.info(f"Epoch {epoch+1}/{self.args.num_epochs}, "
