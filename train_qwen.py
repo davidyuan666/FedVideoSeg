@@ -516,55 +516,54 @@ class UnifiedTrainer:
                     # 长度相同，直接堆叠
                     batch_dict[key] = torch.stack(sequences)
         
-        # 处理其他tensor类型的数据，特别是图像数据
+        # 特殊处理pixel_values - 对于Qwen2.5-VL，不能简单padding
+        if 'pixel_values' in batch[0]:
+            pixel_values_list = [item['pixel_values'] for item in batch]
+            
+            # 检查所有pixel_values的形状是否一致
+            shapes = [pv.shape for pv in pixel_values_list]
+            if len(set(shapes)) == 1:
+                # 形状一致，可以直接堆叠
+                batch_dict['pixel_values'] = torch.stack(pixel_values_list)
+            else:
+                # 形状不一致，保持为列表让模型自己处理
+                # 或者使用batch_size=1来避免这个问题
+                if len(pixel_values_list) == 1:
+                    batch_dict['pixel_values'] = pixel_values_list[0].unsqueeze(0)
+                else:
+                    # 对于批处理大小>1且形状不一致的情况，我们需要特殊处理
+                    logger.warning(f"Pixel values have inconsistent shapes: {shapes}")
+                    logger.warning("Falling back to batch_size=1 processing")
+                    # 只处理第一个样本
+                    batch_dict['pixel_values'] = pixel_values_list[0].unsqueeze(0)
+                    # 相应地只保留第一个样本的其他数据
+                    for key in batch_dict:
+                        if key != 'pixel_values' and isinstance(batch_dict[key], torch.Tensor):
+                            if batch_dict[key].dim() > 0:
+                                batch_dict[key] = batch_dict[key][:1]
+        
+        # 处理image_grid_thw
+        if 'image_grid_thw' in batch[0]:
+            image_grid_thw_list = [item['image_grid_thw'] for item in batch]
+            try:
+                batch_dict['image_grid_thw'] = torch.stack(image_grid_thw_list)
+            except:
+                # 如果无法堆叠，保持为列表
+                batch_dict['image_grid_thw'] = image_grid_thw_list
+        
+        # 处理其他tensor类型的数据
         for key in batch[0].keys():
             if key not in batch_dict:
                 values = [item[key] for item in batch]
                 
                 # 检查是否都是tensor
                 if all(isinstance(v, torch.Tensor) for v in values):
-                    # 特殊处理pixel_values - 需要padding到相同的序列长度
-                    if key == 'pixel_values':
-                        # 检查是否需要padding
-                        seq_lengths = [v.shape[0] for v in values]  # 第一维是序列长度（patch数量）
-                        
-                        if len(set(seq_lengths)) > 1:  # 长度不同，需要padding
-                            max_len = max(seq_lengths)
-                            padded_values = []
-                            
-                            for v in values:
-                                if v.shape[0] < max_len:
-                                    # 在第一维度进行padding，用0填充
-                                    pad_size = max_len - v.shape[0]
-                                    # 创建与v后续维度相同的零张量
-                                    pad_shape = (pad_size,) + v.shape[1:]
-                                    pad_tensor = torch.zeros(pad_shape, dtype=v.dtype, device=v.device)
-                                    padded_v = torch.cat([v, pad_tensor], dim=0)
-                                else:
-                                    padded_v = v
-                                padded_values.append(padded_v)
-                            
-                            batch_dict[key] = torch.stack(padded_values)
-                        else:
-                            # 长度相同，直接堆叠
-                            batch_dict[key] = torch.stack(values)
-                    
-                    # 处理其他图像相关的tensor
-                    elif key.startswith('image_') or key == 'image_patches':
-                        try:
-                            batch_dict[key] = torch.stack(values)
-                        except Exception as e:
-                            logger.warning(f"Cannot stack {key}: {e}, keeping as list")
-                            batch_dict[key] = values
-                    
-                    # 处理其他tensor类型
-                    else:
-                        try:
-                            batch_dict[key] = torch.stack(values)
-                        except Exception as e:
-                            # 如果无法堆叠，保持为列表
-                            logger.debug(f"Cannot stack {key}: {e}, keeping as list")
-                            batch_dict[key] = values
+                    try:
+                        batch_dict[key] = torch.stack(values)
+                    except Exception as e:
+                        # 如果无法堆叠，保持为列表
+                        logger.debug(f"Cannot stack {key}: {e}, keeping as list")
+                        batch_dict[key] = values
                 else:
                     # 非tensor数据保持为列表
                     batch_dict[key] = values
@@ -604,7 +603,7 @@ def parse_args():
                        help="合成数据样本数量（当没有数据文件时使用）")
     
     # 训练参数
-    parser.add_argument("--batch_size", type=int, default=2,
+    parser.add_argument("--batch_size", type=int, default=1,
                        help="批处理大小")
     parser.add_argument("--num_epochs", type=int, default=3,
                        help="训练轮数")
