@@ -153,6 +153,8 @@ class PrivateFederatedClient:
         # 训练
         trainer.model.train()
         total_loss = 0
+        correct_predictions = 0
+        total_samples = 0
         
         for epoch in range(epochs):
             for batch in dataloader:
@@ -160,8 +162,26 @@ class PrivateFederatedClient:
                         for k, v in batch.items()}
                 
                 optimizer.zero_grad()
-                outputs = trainer.model(**batch)
-                loss = outputs['loss']
+                
+                # 前向传播 - 根据训练模式选择不同的计算方式（复制train_qwen.py的逻辑）
+                if self.args.training_mode == "encoder":
+                    outputs = trainer.model(**batch)
+                    loss = outputs['loss']
+                    
+                    # 计算准确率
+                    predictions = torch.argmax(outputs['logits'], dim=-1)
+                    labels = batch['labels']
+                    correct_predictions += (predictions == labels).sum().item()
+                    total_samples += labels.size(0)
+                else:  # instruction mode
+                    # 移除不被模型接受的参数
+                    labels = batch.pop('labels', None)
+                    target_token_id = batch.pop('target_token_id', None)
+                    
+                    # 标准的语言模型损失计算
+                    outputs = trainer.model(**batch, labels=labels)
+                    loss = outputs.loss
+                
                 loss.backward()
                 
                 # 梯度裁剪（隐私保护）
@@ -172,6 +192,13 @@ class PrivateFederatedClient:
                 total_loss += loss.item()
         
         avg_loss = total_loss / (epochs * len(dataloader))
+        
+        # 记录训练结果
+        if self.args.training_mode == "encoder" and total_samples > 0:
+            accuracy = correct_predictions / total_samples
+            logger.info(f"客户端 {self.client_id} 隐私保护本地训练完成，平均损失: {avg_loss:.4f}, 准确率: {accuracy:.4f}")
+        else:
+            logger.info(f"客户端 {self.client_id} 隐私保护本地训练完成，平均损失: {avg_loss:.4f}")
         
         # 获取训练后的权重
         trained_weights = trainer.model.state_dict()
@@ -188,8 +215,6 @@ class PrivateFederatedClient:
                 trained_weights = self.privacy_engine.encrypt_weights(
                     trained_weights, self.client_id
                 )
-        
-        logger.info(f"客户端 {self.client_id} 隐私保护本地训练完成，平均损失: {avg_loss:.4f}")
         
         return trained_weights, len(self.data)
 
