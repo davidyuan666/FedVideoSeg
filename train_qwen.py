@@ -17,6 +17,7 @@ import numpy as np
 from PIL import Image
 from typing import List, Tuple, Dict
 import os
+from qwen_vl_utils import process_vision_info
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -51,13 +52,32 @@ class VideoQADataset(Dataset):
     
     def _get_encoder_item(self, frame, question, label):
         """编码器模式的数据处理"""
-        # 为Qwen2.5-VL添加图像标记
-        text_with_image = f"<image>{question}"
+        # 使用正确的消息格式
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": frame},
+                    {"type": "text", "text": question}
+                ]
+            }
+        ]
+        
+        # 应用聊天模板
+        text = self.processor.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        
+        # 处理图像
+        image_inputs, video_inputs = process_vision_info(messages)
         
         # 处理输入
         inputs = self.processor(
-            text=text_with_image,
-            images=frame,
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -74,14 +94,38 @@ class VideoQADataset(Dataset):
     
     def _get_instruction_item(self, frame, question, label):
         """指令微调模式的数据处理"""
-        # 构建指令，为Qwen2.5-VL添加图像标记
-        instruction = f"<image>" + self.instruction_template.format(question=question)
+        # 构建完整的对话消息
+        instruction_text = self.instruction_template.format(question=question)
         target = "是" if label == 1 else "否"
+        
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": frame},
+                    {"type": "text", "text": instruction_text}
+                ]
+            },
+            {
+                "role": "assistant", 
+                "content": target
+            }
+        ]
+        
+        # 应用聊天模板
+        text = self.processor.apply_chat_template(
+            messages, 
+            tokenize=False
+        )
+        
+        # 处理图像
+        image_inputs, video_inputs = process_vision_info(messages)
         
         # 处理输入
         inputs = self.processor(
-            text=instruction,
-            images=frame,
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -99,8 +143,11 @@ class VideoQADataset(Dataset):
         # 为指令微调准备标签
         input_ids = inputs['input_ids']
         labels = input_ids.clone()
-        labels[:-1] = -100  # 忽略输入部分的损失
-        labels[-1] = target_token_id  # 只计算最后一个token的损失
+        
+        # 找到assistant开始的位置，只对回答部分计算损失
+        tokenized_assistant = self.tokenizer.encode(target, add_special_tokens=False)
+        assistant_start_pos = len(input_ids) - len(tokenized_assistant)
+        labels[:assistant_start_pos] = -100  # 忽略输入部分的损失
         
         inputs['labels'] = labels
         inputs['target_token_id'] = torch.tensor(target_token_id, dtype=torch.long)
@@ -579,5 +626,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
-
