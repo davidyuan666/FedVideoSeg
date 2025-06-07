@@ -13,13 +13,6 @@ FedVideoSeg is a privacy-preserving federated learning framework that combines t
 - **Multimodal Fusion**: Dynamic attention mechanism combining visual, audio, and text information
 - **Real-time Performance**: <45ms inference latency across all device types
 
-## 📊 Performance Highlights
-
-- **87.3% QA Accuracy** (14.2% improvement over centralized baselines)
-- **75% Reduction** in video processing time through binary search
-- **12.8% Improvement** from cross-device collaboration vs single-device training
-- **92.1% Segment Localization Accuracy** with DeepSeek-enhanced relevance scoring
-
 ## 🏗️ Architecture
 
 
@@ -42,29 +35,9 @@ FedVideoSeg is a privacy-preserving federated learning framework that combines t
 3. **Privacy Budget Exhausted**
    ```bash
    # Increase noise multiplier or reduce training rounds
-   python federated_train.py --noise_multiplier 2.0 --num_rounds 2
+   python federated_train.py
    ```
 
-### Performance Optimization
-
-- **GPU Memory**: Use `--batch_size 1` for 8GB GPUs
-- **Training Speed**: Enable `--use_lora` for faster convergence
-- **Privacy-Utility Trade-off**: Adjust `--noise_multiplier` (lower = less privacy, better utility)
-
-## 📊 Monitoring Training
-
-Training logs and metrics are saved to:
-- `output/training_logs/` - Training progress
-- `output/models/` - Saved model checkpoints
-- `output/privacy_reports/` - Differential privacy analysis
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create feature branch: `git checkout -b feature-name`
-3. Commit changes: `git commit -m 'Add feature'`
-4. Push to branch: `git push origin feature-name`
-5. Submit pull request
 
 ## 📄 License
 
@@ -75,7 +48,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ```bibtex
 @article{fedvideoseg2024,
   title={FedVideoSeg: Privacy-Preserving Federated Learning for Educational Video Segment Localization},
-  author={Your Name},
+  author={Dawei Yuan},
   journal={Conference/Journal},
   year={2024}
 }
@@ -89,7 +62,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-**💡 Need Help?** 
-- Check our [FAQ](docs/FAQ.md)
-- Join our [Discord](https://discord.gg/fedvideoseg) 
-- Open an [Issue](https://github.com/your-repo/FedVideoSeg/issues)
